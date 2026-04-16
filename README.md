@@ -13,7 +13,71 @@ This code expects:
 ```bash
 python compile_to_ir.py ir_test_program.py
 python compare_exec_with_ir.py ir_test_program.py
+python cyclomatic_complexity.py ir_test_program.py
 ```
+
+The `cyclomatic_complexity.py` script is a small example of a source-analysis tool made possible by pyssa's explicit nested `Region` CFG IR: it compiles Python to IR, walks each region, and reports cyclomatic complexity structurally from the region CFG.
+
+## Case study: cyclomatic complexity three ways
+
+As a small experiment, this repository includes three versions of the same tool:
+
+- `cyclomatic_complexity.py`: compute complexity from pyssa IR regions
+- `cyclomatic_complexity_ast.py`: compute complexity directly from Python AST nodes
+- `cyclomatic_complexity_bytecode.py`: compute complexity from CPython bytecode CFG recovery
+
+You can run them on the same input:
+
+```bash
+python cyclomatic_complexity.py ir_test_program.py
+python cyclomatic_complexity_ast.py ir_test_program.py
+python cyclomatic_complexity_bytecode.py ir_test_program.py
+```
+
+All three emit the same recursive JSON shape:
+
+```json
+{
+  "name": "<module>",
+  "cyclomatic_complexity": 2,
+  "child_regions": []
+}
+```
+
+### Result
+
+For this mini-experiment, the pyssa-based version is the smallest and simplest implementation in terms of LOC.
+
+As a second metric beyond LOC, we can also measure the complexity of the implementations themselves. Since pyssa reports complexity per region, it is useful to summarize the recursive region tree for each implementation with several descriptive statistics rather than just a single total. The table below reports the sum, min, max, average, and population standard deviation of per-region cyclomatic complexity for each implementation file.
+
+| Tool | Basis | LOC | Sum | Min | Max | Avg | Stddev |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `cyclomatic_complexity.py` | pyssa `Region` CFG | 94 | 19 | 1 | 13 | 3.80 | 4.67 |
+| `cyclomatic_complexity_ast.py` | Python AST | 238 | 71 | 1 | 10 | 1.97 | 1.72 |
+| `cyclomatic_complexity_bytecode.py` | CPython bytecode | 202 | 59 | 1 | 32 | 5.36 | 8.51 |
+
+Viewed this way, the pyssa-based implementation is still clearly the smallest by LOC, while the bytecode-based implementation shows the highest peak and widest spread of local complexity. The AST-based implementation distributes complexity more evenly, but across many more lines of code and more implementation machinery.
+
+### Why the pyssa version is smaller
+
+With pyssa, the hard parts are already explicit in the IR:
+
+- nested scopes are already nested as `child_regions`
+- control flow is already split into basic blocks
+- branches, jumps, and loop iteration edges are already explicit
+- the tool can compute complexity directly from the region CFG
+
+The AST version has to reconstruct complexity from syntax-level decision points and scope structure. The bytecode version has to recover a CFG from instructions, jump targets, fallthrough, and exception tables.
+
+### Caveat
+
+The three tools are intentionally a comparison, not a proof that all definitions coincide exactly. In practice they can disagree:
+
+- AST complexity depends on which syntax forms count as decision points
+- bytecode complexity depends on how CFG recovery treats compiler-generated structure
+- pyssa complexity reflects the explicit IR CFG produced by the frontend
+
+That difference is part of the point of the experiment: pyssa gives a direct, structured, implementation-friendly CFG representation for building analysis tools.
 
 ## Current AST lowering coverage
 
