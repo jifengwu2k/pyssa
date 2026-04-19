@@ -1,19 +1,12 @@
 # Copyright (c) 2026 Jifeng Wu
 # Licensed under the Apache-2.0 License. See LICENSE file in the project root for full license information.
+import __future__
 import ast
 import builtins
-import collections.abc
-import importlib
-import importlib.machinery
-import importlib.util
-import inspect
-import operator
-import os
 import symtable
-import sys
 import types
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import attrs
 from cowlist import COWList
@@ -491,8 +484,6 @@ def render_payload(value):
 
 def render_instruction(instr, indent="    "):
     # Render one instruction using attrs field order and a small amount of IR-specific formatting.
-    import attrs
-
     fields = attrs.fields(type(instr))
     names = [field.name for field in fields]
     payload_names = [name for name in names if name not in VALUE_FIELDS and name not in EFFECT_FIELDS]
@@ -561,8 +552,8 @@ class RegionContext:
     builder: "BlockBuilder"
     child_tables: List[Any] = attrs.field(factory=list)
     child_codes: List[types.CodeType] = attrs.field(factory=list)
-    next_child_table: int = 0
-    next_child_code: int = 0
+    used_child_tables: Set[int] = attrs.field(factory=set)
+    used_child_codes: Set[int] = attrs.field(factory=set)
     next_child_region_label: int = 0
 
 
@@ -825,6 +816,15 @@ def lower_genexpr_generator(state, ctx, generators, index, emit_item, exhaustion
         ctx.builder.emit(attach_meta(state, DeleteName(scope=Scope.LOCAL, name=iter_name), generator))
     ctx.builder.terminate(attach_meta(state, Jump(target=exhaustion_label), generator))
 
+def lower_stmt_list(state: CompilerState, ctx: RegionContext, stmts: Sequence[ast.stmt]) -> List[Region]:
+    nested_regions = []
+    for stmt in stmts:
+        child_regions = lower_stmt(state, ctx, stmt)
+        if child_regions:
+            nested_regions.extend(child_regions)
+    return nested_regions
+
+
 def lower_stmt(state: CompilerState, ctx: RegionContext, stmt: ast.stmt) -> List[Region]:
     """Lower one statement, returning any nested regions created along the way."""
     if isinstance(stmt, ast.FunctionDef):
@@ -855,29 +855,21 @@ def lower_stmt(state: CompilerState, ctx: RegionContext, stmt: ast.stmt) -> List
         lower_expr(state, ctx, stmt.value)
         return []
     if isinstance(stmt, ast.If):
-        lower_if(state, ctx, stmt)
-        return []
+        return lower_if(state, ctx, stmt)
     if isinstance(stmt, ast.For):
-        lower_for(state, ctx, stmt)
-        return []
+        return lower_for(state, ctx, stmt)
     if isinstance(stmt, ast.While):
-        lower_while(state, ctx, stmt)
-        return []
+        return lower_while(state, ctx, stmt)
     if isinstance(stmt, ast.AsyncFor):
-        lower_async_for(state, ctx, stmt)
-        return []
+        return lower_async_for(state, ctx, stmt)
     if isinstance(stmt, ast.With):
-        lower_with(state, ctx, stmt)
-        return []
+        return lower_with(state, ctx, stmt)
     if isinstance(stmt, ast.AsyncWith):
-        lower_async_with(state, ctx, stmt)
-        return []
+        return lower_async_with(state, ctx, stmt)
     if isinstance(stmt, ast.TryStar):
-        lower_try_star(state, ctx, stmt)
-        return []
+        return lower_try_star(state, ctx, stmt)
     if isinstance(stmt, ast.Try):
-        lower_try(state, ctx, stmt)
-        return []
+        return lower_try(state, ctx, stmt)
     if isinstance(stmt, ast.Break):
         lower_break(state, ctx, stmt)
         return []
@@ -900,14 +892,26 @@ def lower_stmt(state: CompilerState, ctx: RegionContext, stmt: ast.stmt) -> List
         cause = None if stmt.cause is None else lower_expr(state, ctx, stmt.cause)
         ctx.builder.terminate(attach_meta(state, Raise(exc=exc, cause=cause), stmt))
         return []
+    if isinstance(stmt, ast.Assert):
+        lower_assert(state, ctx, stmt)
+        return []
     if isinstance(stmt, ast.Delete):
         for target in stmt.targets:
             delete_target(state, ctx, target)
         return []
     if isinstance(stmt, ast.Match):
-        lower_match(state, ctx, stmt)
-        return []
+        return lower_match(state, ctx, stmt)
     raise UnsupportedFeature(stmt, 'statement %s is not implemented in AST lowering' % type(stmt).__name__)
+
+def future_annotations_enabled(code_obj):
+    return bool(code_obj.co_flags & __future__.annotations.compiler_flag)
+
+
+def lower_annotation_expr(state, ctx, expr):
+    if future_annotations_enabled(ctx.code_obj):
+        return const_value(state, ctx, ast.unparse(expr), expr)
+    return lower_expr(state, ctx, expr)
+
 
 def lower_function_def(state, parent_ctx, node, is_async):
     # Build the nested function region first, then wrap it in a runtime function object.
@@ -923,11 +927,23 @@ def lower_function_def(state, parent_ctx, node, is_async):
         if default is None:
             continue
         kwonly_items.append((arg.arg, lower_expr(state, parent_ctx, default)))
+    annotation_items = []
+    all_annotated_args = list(node.args.posonlyargs) + list(node.args.args)
+    if node.args.vararg is not None:
+        all_annotated_args.append(node.args.vararg)
+    all_annotated_args.extend(node.args.kwonlyargs)
+    if node.args.kwarg is not None:
+        all_annotated_args.append(node.args.kwarg)
+    for arg in all_annotated_args:
+        if arg.annotation is not None:
+            annotation_items.append((arg.arg, lower_annotation_expr(state, parent_ctx, arg.annotation)))
+    if node.returns is not None:
+        annotation_items.append(('return', lower_annotation_expr(state, parent_ctx, node.returns)))
     func_temp = fresh_temp(state)
     parent_ctx.builder.emit(
         attach_meta(
             state,
-            MakeFunction(dst=func_temp, code=child_label, defaults=default_values, kwdefaults=COWList(kwonly_items)),
+            MakeFunction(dst=func_temp, code=child_label, defaults=default_values, kwdefaults=COWList(kwonly_items), annotations=COWList(annotation_items)),
             node,
         )
     )
@@ -970,29 +986,44 @@ def lower_class_def(state, parent_ctx, node):
     return [nested_region]
 
 def lower_if(state, ctx, stmt):
+    nested_regions = []
     cond = lower_expr(state, ctx, stmt.test)
     then_label = ctx.builder.new_label()
     else_label = ctx.builder.new_label()
     end_label = ctx.builder.new_label()
     ctx.builder.terminate(attach_meta(state, Branch(cond=cond, true_label=then_label, false_label=else_label), stmt.test))
     ctx.builder.start_block(then_label)
-    for body_stmt in stmt.body:
-        nested = lower_stmt(state, ctx, body_stmt)
-        if nested:
-            raise UnsupportedFeature(body_stmt, 'nested region definitions inside if are not supported in this position')
+    nested_regions.extend(lower_stmt_list(state, ctx, stmt.body))
     then_open = ctx.builder.is_open()
     if then_open:
         ctx.builder.terminate(attach_meta(state, Jump(target=end_label), stmt))
     ctx.builder.start_block(else_label)
-    for orelse_stmt in stmt.orelse:
-        nested = lower_stmt(state, ctx, orelse_stmt)
-        if nested:
-            raise UnsupportedFeature(orelse_stmt, 'nested region definitions inside else are not supported in this position')
+    nested_regions.extend(lower_stmt_list(state, ctx, stmt.orelse))
     else_open = ctx.builder.is_open()
     if else_open:
         ctx.builder.terminate(attach_meta(state, Jump(target=end_label), stmt))
     if then_open or else_open:
         ctx.builder.start_block(end_label)
+    return nested_regions
+
+
+def lower_assert(state, ctx, stmt):
+    # Match Python's compile-time handling of assert under optimization.
+    if not __debug__:
+        return
+    cond = lower_expr(state, ctx, stmt.test)
+    continue_label = ctx.builder.new_label()
+    raise_label = ctx.builder.new_label()
+    ctx.builder.terminate(attach_meta(state, Branch(cond=cond, true_label=continue_label, false_label=raise_label), stmt.test))
+    ctx.builder.start_block(raise_label)
+    assertion_error = builtin_const_value(state, ctx, builtins.AssertionError, stmt)
+    exc = assertion_error
+    if stmt.msg is not None:
+        msg = lower_expr(state, ctx, stmt.msg)
+        exc = fresh_temp(state)
+        ctx.builder.emit(attach_meta(state, Call(dst=exc, callee=assertion_error, args=normal_call_args([msg]), kwargs=normal_call_kwargs(), flags=0), stmt.msg))
+    ctx.builder.terminate(attach_meta(state, Raise(exc=exc), stmt))
+    ctx.builder.start_block(continue_label)
 
 def push_loop(state, break_label, continue_label):
     state.loop_stack.append((break_label, continue_label))
@@ -1067,6 +1098,7 @@ def lower_augassign(state, ctx, stmt):
     raise UnsupportedFeature(target, 'augmented assignment target %s is not implemented in AST lowering' % type(target).__name__)
 
 def lower_for(state, ctx, stmt):
+    nested_regions = []
     iterable = lower_expr(state, ctx, stmt.iter)
     iter_temp = fresh_temp(state)
     ctx.builder.emit(attach_meta(state, GetIter(dst=iter_temp, iterable=iterable), stmt.iter))
@@ -1086,26 +1118,22 @@ def lower_for(state, ctx, stmt):
     ctx.builder.start_block(body_label)
     push_loop(state, final_label, header_label)
     assign_target(state, ctx, stmt.target, value_dst)
-    for body_stmt in stmt.body:
-        nested = lower_stmt(state, ctx, body_stmt)
-        if nested:
-            raise UnsupportedFeature(body_stmt, 'nested region definitions inside for are not supported in this position')
+    nested_regions.extend(lower_stmt_list(state, ctx, stmt.body))
     pop_loop(state, )
     if ctx.builder.is_open():
         ctx.builder.terminate(attach_meta(state, Jump(target=header_label), stmt))
     if stmt.orelse:
         ctx.builder.start_block(orelse_label)
-        for orelse_stmt in stmt.orelse:
-            nested = lower_stmt(state, ctx, orelse_stmt)
-            if nested:
-                raise UnsupportedFeature(orelse_stmt, 'nested region definitions inside for-else are not supported in this position')
+        nested_regions.extend(lower_stmt_list(state, ctx, stmt.orelse))
         if ctx.builder.is_open():
             ctx.builder.terminate(attach_meta(state, Jump(target=final_label), stmt))
         ctx.builder.start_block(final_label)
     else:
         ctx.builder.start_block(exit_label)
+    return nested_regions
 
 def lower_while(state, ctx, stmt):
+    nested_regions = []
     cond_label = ctx.builder.new_label()
     body_label = ctx.builder.new_label()
     orelse_label = ctx.builder.new_label() if stmt.orelse else None
@@ -1117,26 +1145,22 @@ def lower_while(state, ctx, stmt):
     ctx.builder.terminate(attach_meta(state, Branch(cond=cond, true_label=body_label, false_label=exit_label), stmt.test))
     ctx.builder.start_block(body_label)
     push_loop(state, final_label, cond_label)
-    for body_stmt in stmt.body:
-        nested = lower_stmt(state, ctx, body_stmt)
-        if nested:
-            raise UnsupportedFeature(body_stmt, 'nested region definitions inside while are not supported in this position')
+    nested_regions.extend(lower_stmt_list(state, ctx, stmt.body))
     pop_loop(state, )
     if ctx.builder.is_open():
         ctx.builder.terminate(attach_meta(state, Jump(target=cond_label), stmt))
     if stmt.orelse:
         ctx.builder.start_block(orelse_label)
-        for orelse_stmt in stmt.orelse:
-            nested = lower_stmt(state, ctx, orelse_stmt)
-            if nested:
-                raise UnsupportedFeature(orelse_stmt, 'nested region definitions inside while-else are not supported in this position')
+        nested_regions.extend(lower_stmt_list(state, ctx, stmt.orelse))
         if ctx.builder.is_open():
             ctx.builder.terminate(attach_meta(state, Jump(target=final_label), stmt))
         ctx.builder.start_block(final_label)
     else:
         ctx.builder.start_block(exit_label)
+    return nested_regions
 
 def lower_async_for(state, ctx, stmt):
+    nested_regions = []
     # Async iteration is explicit: get __aiter__, await each __anext__, and catch StopAsyncIteration.
     iterable = lower_expr(state, ctx, stmt.iter)
     aiter_temp = fresh_temp(state)
@@ -1175,24 +1199,19 @@ def lower_async_for(state, ctx, stmt):
     ctx.builder.start_block(body_label)
     push_loop(state, final_label, header_label)
     assign_target(state, ctx, stmt.target, next_value)
-    for body_stmt in stmt.body:
-        nested = lower_stmt(state, ctx, body_stmt)
-        if nested:
-            raise UnsupportedFeature(body_stmt, 'nested region definitions inside async for are not supported in this position')
+    nested_regions.extend(lower_stmt_list(state, ctx, stmt.body))
     pop_loop(state, )
     if ctx.builder.is_open():
         ctx.builder.terminate(attach_meta(state, Jump(target=header_label), stmt))
     if stmt.orelse:
         ctx.builder.start_block(orelse_label)
-        for orelse_stmt in stmt.orelse:
-            nested = lower_stmt(state, ctx, orelse_stmt)
-            if nested:
-                raise UnsupportedFeature(orelse_stmt, 'nested region definitions inside async for-else are not supported in this position')
+        nested_regions.extend(lower_stmt_list(state, ctx, stmt.orelse))
         if ctx.builder.is_open():
             ctx.builder.terminate(attach_meta(state, Jump(target=final_label), stmt))
         ctx.builder.start_block(final_label)
     else:
         ctx.builder.start_block(exit_label)
+    return nested_regions
 
 def await_value(state, ctx, value, node):
     awaitable = fresh_temp(state)
@@ -1207,19 +1226,16 @@ def call_and_await(state, ctx, callee, args, node):
     return await_value(state, ctx, call_result, node)
 
 def lower_with(state, ctx, stmt):
-    lower_with_items(state, ctx, stmt.items, stmt.body, stmt, is_async=False)
+    return lower_with_items(state, ctx, stmt.items, stmt.body, stmt, is_async=False)
 
 def lower_async_with(state, ctx, stmt):
-    lower_with_items(state, ctx, stmt.items, stmt.body, stmt, is_async=True)
+    return lower_with_items(state, ctx, stmt.items, stmt.body, stmt, is_async=True)
 
 def lower_with_items(state, ctx, items, body, owner, is_async=False):
+    nested_regions = []
     # Lower nested with-items recursively so each item gets its own synthetic finally path.
     if not items:
-        for body_stmt in body:
-            nested = lower_stmt(state, ctx, body_stmt)
-            if nested:
-                raise UnsupportedFeature(body_stmt, 'nested region definitions inside with are not supported in this position')
-        return
+        return lower_stmt_list(state, ctx, body)
     item = items[0]
     mgr = lower_expr(state, ctx, item.context_expr)
     exit_attr = '__aexit__' if is_async else '__exit__'
@@ -1242,7 +1258,7 @@ def lower_with_items(state, ctx, items, body, owner, is_async=False):
     propagate_label = ctx.builder.new_label()
     after_label = ctx.builder.new_label()
     ctx.builder.emit(attach_meta(state, PushTry(finally_label=finally_label), owner))
-    lower_with_items(state, ctx, items[1:], body, owner, is_async=is_async)
+    nested_regions.extend(lower_with_items(state, ctx, items[1:], body, owner, is_async=is_async))
     if ctx.builder.is_open():
         ctx.builder.emit(attach_meta(state, PopTry(), owner))
         ctx.builder.terminate(attach_meta(state, Jump(target=finally_label), owner))
@@ -1286,8 +1302,10 @@ def lower_with_items(state, ctx, items, body, owner, is_async=False):
     if ctx.builder.is_open():
         ctx.builder.terminate(attach_meta(state, Jump(target=after_label), owner))
     ctx.builder.start_block(after_label)
+    return nested_regions
 
 def lower_try(state, ctx, stmt):
+    nested_regions = []
     # Try statements are represented with explicit synthetic try targets and CFG dispatch blocks.
     if not stmt.handlers and (not stmt.finalbody):
         raise UnsupportedFeature(stmt, 'try without except/finally is not implemented in AST lowering')
@@ -1299,10 +1317,7 @@ def lower_try(state, ctx, stmt):
         ctx.builder.emit(attach_meta(state, PushTry(finally_label=finally_label), stmt))
     if stmt.handlers:
         ctx.builder.emit(attach_meta(state, PushTry(except_label=except_dispatch_label), stmt))
-    for body_stmt in stmt.body:
-        nested = lower_stmt(state, ctx, body_stmt)
-        if nested:
-            raise UnsupportedFeature(body_stmt, 'nested region definitions inside try are not supported in this position')
+    nested_regions.extend(lower_stmt_list(state, ctx, stmt.body))
     if ctx.builder.is_open():
         if stmt.handlers:
             ctx.builder.emit(attach_meta(state, PopTry(), stmt))
@@ -1315,10 +1330,7 @@ def lower_try(state, ctx, stmt):
             ctx.builder.terminate(attach_meta(state, Jump(target=after_label), stmt))
     if stmt.orelse:
         ctx.builder.start_block(orelse_label)
-        for orelse_stmt in stmt.orelse:
-            nested = lower_stmt(state, ctx, orelse_stmt)
-            if nested:
-                raise UnsupportedFeature(orelse_stmt, 'nested region definitions inside else are not supported in this position')
+        nested_regions.extend(lower_stmt_list(state, ctx, stmt.orelse))
         if ctx.builder.is_open():
             if stmt.finalbody:
                 ctx.builder.emit(attach_meta(state, PopTry(), stmt))
@@ -1345,10 +1357,7 @@ def lower_try(state, ctx, stmt):
             if handler.name:
                 scope = scope_for_store(state, ctx, handler.name)
                 ctx.builder.emit(attach_meta(state, StoreName(src=current_exc, scope=scope, name=handler.name), handler))
-            for handler_stmt in handler.body:
-                nested = lower_stmt(state, ctx, handler_stmt)
-                if nested:
-                    raise UnsupportedFeature(handler_stmt, 'nested region definitions inside except are not supported in this position')
+            nested_regions.extend(lower_stmt_list(state, ctx, handler.body))
             if ctx.builder.is_open():
                 if handler.name:
                     none_temp = const_value(state, ctx, None, handler)
@@ -1367,18 +1376,17 @@ def lower_try(state, ctx, stmt):
         ctx.builder.terminate(attach_meta(state, Reraise(), stmt))
     if stmt.finalbody:
         ctx.builder.start_block(finally_label)
-        for final_stmt in stmt.finalbody:
-            nested = lower_stmt(state, ctx, final_stmt)
-            if nested:
-                raise UnsupportedFeature(final_stmt, 'nested region definitions inside finally are not supported in this position')
+        nested_regions.extend(lower_stmt_list(state, ctx, stmt.finalbody))
         if ctx.builder.is_open():
             ctx.builder.emit(attach_meta(state, EndFinally(), stmt))
             if ctx.builder.is_open():
                 ctx.builder.terminate(attach_meta(state, Jump(target=after_label), stmt))
     ctx.builder.start_block(after_label)
+    return nested_regions
 
 
 def lower_try_star(state, ctx, stmt):
+    nested_regions = []
     # Exception groups use the same explicit CFG shape as `try`, but handler tests go through
     # the dedicated exception-group matcher instruction.
     if not stmt.handlers and (not stmt.finalbody):
@@ -1391,10 +1399,7 @@ def lower_try_star(state, ctx, stmt):
         ctx.builder.emit(attach_meta(state, PushTry(finally_label=finally_label), stmt))
     if stmt.handlers:
         ctx.builder.emit(attach_meta(state, PushTry(except_label=except_dispatch_label), stmt))
-    for body_stmt in stmt.body:
-        nested = lower_stmt(state, ctx, body_stmt)
-        if nested:
-            raise UnsupportedFeature(body_stmt, 'nested region definitions inside try* are not supported in this position')
+    nested_regions.extend(lower_stmt_list(state, ctx, stmt.body))
     if ctx.builder.is_open():
         if stmt.handlers:
             ctx.builder.emit(attach_meta(state, PopTry(), stmt))
@@ -1407,10 +1412,7 @@ def lower_try_star(state, ctx, stmt):
             ctx.builder.terminate(attach_meta(state, Jump(target=after_label), stmt))
     if stmt.orelse:
         ctx.builder.start_block(orelse_label)
-        for orelse_stmt in stmt.orelse:
-            nested = lower_stmt(state, ctx, orelse_stmt)
-            if nested:
-                raise UnsupportedFeature(orelse_stmt, 'nested region definitions inside try*-else are not supported in this position')
+        nested_regions.extend(lower_stmt_list(state, ctx, stmt.orelse))
         if ctx.builder.is_open():
             if stmt.finalbody:
                 ctx.builder.emit(attach_meta(state, PopTry(), stmt))
@@ -1437,10 +1439,7 @@ def lower_try_star(state, ctx, stmt):
             if handler.name:
                 scope = scope_for_store(state, ctx, handler.name)
                 ctx.builder.emit(attach_meta(state, StoreName(src=current_exc, scope=scope, name=handler.name), handler))
-            for handler_stmt in handler.body:
-                nested = lower_stmt(state, ctx, handler_stmt)
-                if nested:
-                    raise UnsupportedFeature(handler_stmt, 'nested region definitions inside except* are not supported in this position')
+            nested_regions.extend(lower_stmt_list(state, ctx, handler.body))
             if ctx.builder.is_open():
                 if handler.name:
                     none_temp = const_value(state, ctx, None, handler)
@@ -1459,15 +1458,13 @@ def lower_try_star(state, ctx, stmt):
         ctx.builder.terminate(attach_meta(state, Reraise(), stmt))
     if stmt.finalbody:
         ctx.builder.start_block(finally_label)
-        for final_stmt in stmt.finalbody:
-            nested = lower_stmt(state, ctx, final_stmt)
-            if nested:
-                raise UnsupportedFeature(final_stmt, 'nested region definitions inside try*-finally are not supported in this position')
+        nested_regions.extend(lower_stmt_list(state, ctx, stmt.finalbody))
         if ctx.builder.is_open():
             ctx.builder.emit(attach_meta(state, EndFinally(), stmt))
             if ctx.builder.is_open():
                 ctx.builder.terminate(attach_meta(state, Jump(target=after_label), stmt))
     ctx.builder.start_block(after_label)
+    return nested_regions
 
 
 def bind_pattern_name(state, ctx, name, value, node):
@@ -1498,6 +1495,7 @@ def emit_pattern_length_check(state, ctx, subject, expected, allow_extra, node):
 
 
 def lower_match(state, ctx, stmt):
+    nested_regions = []
     subject = lower_expr(state, ctx, stmt.subject)
     end_label = ctx.builder.new_label()
     for index, case in enumerate(stmt.cases):
@@ -1510,15 +1508,13 @@ def lower_match(state, ctx, stmt):
             guard = lower_expr(state, ctx, case.guard)
             ctx.builder.terminate(attach_meta(state, Branch(cond=guard, true_label=guarded_body_label, false_label=failure_label), case.guard))
             ctx.builder.start_block(guarded_body_label)
-        for body_stmt in case.body:
-            nested = lower_stmt(state, ctx, body_stmt)
-            if nested:
-                raise UnsupportedFeature(body_stmt, 'nested region definitions inside match-case are not supported in this position')
+        nested_regions.extend(lower_stmt_list(state, ctx, case.body))
         if ctx.builder.is_open():
             ctx.builder.terminate(attach_meta(state, Jump(target=end_label), case.pattern))
         if failure_label is not end_label:
             ctx.builder.start_block(failure_label)
     ctx.builder.start_block(end_label)
+    return nested_regions
 
 
 def lower_pattern_values(state, ctx, patterns, values, success_label, failure_label, node):
@@ -2218,30 +2214,45 @@ def take_child_region_inputs(state, ctx, table_type: ChildRegionType, symtable_n
     - the `symtable` child provides scope information
     - the compiled child code object provides flags, locals, cells, and freevars
 
-    Matching is done in source order using `ctx.next_child_table` and
-    `ctx.next_child_code` rather than by global lookup. Callers provide the exact
-    symtable and code-object names to match so this helper does not need to rewrite
-    names like `<genexpr>`.
+    Matching prefers an unused child with the same source line when available,
+    and otherwise falls back to the first unused child with the requested kind
+    and name. This keeps lowering robust even when CFG emission order differs
+    from textual order (e.g. try/except/else lowering).
     """
-    table = None
-    for index in range(ctx.next_child_table, len(ctx.child_tables)):
-        candidate = ctx.child_tables[index]
-        if candidate.get_type() == table_type.value and candidate.get_name() == symtable_name:
-            table = candidate
-            ctx.next_child_table = index + 1
-            break
-    if table is None:
-        raise UnsupportedFeature(owner, 'missing nested symbol-table child for region')
+    owner_lineno = getattr(owner, 'lineno', None)
 
-    code_obj = None
-    for index in range(ctx.next_child_code, len(ctx.child_codes)):
-        candidate = ctx.child_codes[index]
-        if candidate.co_name == code_name:
-            code_obj = candidate
-            ctx.next_child_code = index + 1
+    table_index = None
+    for index, candidate in enumerate(ctx.child_tables):
+        if index in ctx.used_child_tables:
+            continue
+        if candidate.get_type() != table_type.value or candidate.get_name() != symtable_name:
+            continue
+        candidate_lineno = candidate.get_lineno() if hasattr(candidate, 'get_lineno') else None
+        if owner_lineno is not None and candidate_lineno == owner_lineno:
+            table_index = index
             break
-    if code_obj is None:
+        if table_index is None:
+            table_index = index
+    if table_index is None:
+        raise UnsupportedFeature(owner, 'missing nested symbol-table child for region')
+    ctx.used_child_tables.add(table_index)
+    table = ctx.child_tables[table_index]
+
+    code_index = None
+    for index, candidate in enumerate(ctx.child_codes):
+        if index in ctx.used_child_codes:
+            continue
+        if candidate.co_name != code_name:
+            continue
+        if owner_lineno is not None and getattr(candidate, 'co_firstlineno', None) == owner_lineno:
+            code_index = index
+            break
+        if code_index is None:
+            code_index = index
+    if code_index is None:
         raise UnsupportedFeature(owner, 'missing nested code object for region')
+    ctx.used_child_codes.add(code_index)
+    code_obj = ctx.child_codes[code_index]
     return (table, code_obj)
 
 def child_region_name(state, base_name):
@@ -2360,1142 +2371,4 @@ def compare_op(state, op):
             return name
     raise UnsupportedFeature(op, 'compare operator %s is not implemented in AST lowering' % type(op).__name__)
 
-
-
-# ---------------------------------------------------------------------------
-# IR interpreter
-# ---------------------------------------------------------------------------
-
-
-"""Execute the project IR.
-
-The interpreter is intentionally semantic rather than optimized. It executes Region blocks,
-maintains explicit temp/local/cell state, and implements the extra control-flow machinery used
-by the AST frontend such as try/finally cleanup and structured escape targets.
-"""
-
-# Sentinel distinct from user-visible None.
-_UNSET = object()
-
-
-class IRHook(object):
-    # Optional observer interface used by tests and debugging tools.
-    def on_enter_frame(self, frame):
-        pass
-
-    def on_exit_frame(self, frame, result=None, exception=None):
-        pass
-
-    def before_instruction(self, frame, instr):
-        pass
-
-    def after_instruction(self, frame, instr, result=_UNSET):
-        pass
-
-    def on_exception(self, frame, instr, exception):
-        pass
-
-
-# Mutable box used to model Python closure cells.
-@attrs.define
-class Cell:
-    value: Any = _UNSET
-
-
-class VerboseTraceHook(IRHook):
-    # Simple stderr trace of executed IR instructions.
-    def before_instruction(self, frame, instr):
-        location = "%s L%s:%s" % (frame.function.__qualname__, frame.block_label.index, frame.instr_index)
-        print("%s  %s" % (location, render_instruction(instr, indent="")), file=sys.stderr)
-
-
-@attrs.define
-class Frame:
-    # Runtime state for one executing region. Besides locals/cells/temps it also tracks
-    # pending control transfers that must survive through finally blocks.
-    interpreter: "IRInterpreter"
-    function: "IRFunction"
-    function_ir: Region
-    globals: Dict[str, Any]
-    locals: Dict[str, Any]
-    cells: Dict[str, Cell]
-    temps: Dict[TemporaryValue, Any] = attrs.field(factory=dict)
-    block_label: Optional[BasicBlockLabel] = None
-    instr_index: int = 0
-    finished: bool = False
-    return_value: Any = None
-    current_exception: Optional[BaseException] = None
-    exc_stack: list = attrs.field(factory=list)
-    pending_send_value: Any = _UNSET
-    try_stack: list = attrs.field(factory=list)
-    pending_return_value: Any = _UNSET
-    pending_jump_label: Any = _UNSET
-
-
-class IRFunction(object):
-    # Runtime callable wrapper around one Region.
-    def __init__(self, interpreter, region_ir, globals_dict, closure_cells=None, qualname=None, preloaded_locals=None):
-        self.interpreter = interpreter
-        self.function_ir = region_ir
-        self.region_ir = region_ir
-        self.globals = globals_dict
-        self.closure_cells = dict(closure_cells or {})
-        self.preloaded_locals = dict(preloaded_locals or {})
-        self.defaults = None
-        self.kwdefaults = None
-        self.annotations = {}
-        self.__name__ = region_ir.name.split("#", 1)[0]
-        self.__qualname__ = qualname or self.__name__
-        self.__defaults__ = self.defaults
-        self.__kwdefaults__ = self.kwdefaults
-        self.__annotations__ = self.annotations
-        self.__globals__ = globals_dict
-
-    def __repr__(self):
-        return "<IRFunction %s>" % (self.__qualname__,)
-
-    def __call__(self, *args, **kwargs):
-        return self.interpreter.call_function(self, args, kwargs)
-
-    def __get__(self, obj, objtype=None):
-        if obj is None:
-            return self
-        return BoundIRMethod(self, obj)
-
-
-class BoundIRMethod(object):
-    # Small descriptor wrapper so IR-defined functions behave like Python methods.
-    def __init__(self, function, instance):
-        self.function = function
-        self.instance = instance
-        self.__name__ = function.__name__
-        self.__qualname__ = function.__qualname__
-
-    def __call__(self, *args, **kwargs):
-        return self.function(self.instance, *args, **kwargs)
-
-
-class IRGenerator(object):
-    # Adapter exposing generator protocol on top of a suspended IR frame.
-    def __init__(self, interpreter, frame):
-        self.interpreter = interpreter
-        self.frame = frame
-        self.closed = False
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.send(None)
-
-    def send(self, value):
-        if self.closed:
-            raise StopIteration
-        event = self.interpreter.resume_frame(self.frame, send_value=value)
-        kind = event[0]
-        if kind == "yield":
-            return event[1]
-        if kind == "return":
-            self.closed = True
-            raise StopIteration(event[1])
-        raise RuntimeError("unexpected generator event %r" % (event,))
-
-
-class IRCoroutine(collections.abc.Coroutine):
-    # Adapter exposing coroutine protocol on top of a suspended IR frame.
-    def __init__(self, interpreter, frame):
-        self.interpreter = interpreter
-        self.frame = frame
-        self.done = False
-
-    def __await__(self):
-        return self
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.send(None)
-
-    def send(self, value):
-        if self.done:
-            raise StopIteration(None)
-        kind, result = self.interpreter.resume_frame(self.frame, send_value=value)
-        if kind == "yield":
-            return result
-        if kind == "return":
-            self.done = True
-            raise StopIteration(result)
-        raise RuntimeError("unexpected coroutine event %r" % ((kind, result),))
-
-    def throw(self, typ, val=None, tb=None):
-        self.done = True
-        if val is None:
-            if isinstance(typ, BaseException):
-                raise typ
-            raise typ()
-        raise val
-
-    def close(self):
-        self.done = True
-
-
-class IRAsyncGenerator(object):
-    # Adapter exposing async-generator protocol on top of a suspended IR frame.
-    def __init__(self, interpreter, frame):
-        self.interpreter = interpreter
-        self.frame = frame
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self.closed:
-            raise StopAsyncIteration
-        kind, value = self.interpreter.resume_frame(self.frame, send_value=None)
-        if kind == "yield":
-            return value
-        if kind == "return":
-            self.closed = True
-            raise StopAsyncIteration
-        raise RuntimeError("unexpected async generator event %r" % ((kind, value),))
-
-
-class IRInterpreter(object):
-    # Small tree interpreter for nested Region trees.
-    def __init__(self, module_ir, hooks=(), module_name="__main__", module_path=None, search_path=None):
-        self.module_ir = module_ir
-        self.hooks = tuple(hooks)
-        self.module_name = module_name
-        self.module_path = None if module_path is None else os.path.abspath(module_path)
-        self.search_path = self.normalize_search_path(search_path, self.module_path)
-        self.module_ir_cache = {}
-        self.last_completed_frame = None
-
-    def normalize_search_path(self, search_path, module_path):
-        raw_entries = []
-        if module_path is not None:
-            raw_entries.append(os.path.dirname(module_path))
-        if search_path is None:
-            raw_entries.extend(sys.path)
-        else:
-            raw_entries.extend(search_path)
-
-        normalized_entries = []
-        seen = set()
-        for entry in raw_entries:
-            normalized = os.path.abspath(entry or os.getcwd())
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            normalized_entries.append(normalized)
-        return tuple(normalized_entries)
-
-    def run_module_region(self, module_ir, globals_dict, locals_dict=None, qualname="<module>"):
-        if locals_dict is None:
-            locals_dict = globals_dict
-        module_function = IRFunction(self, module_ir, globals_dict, qualname=qualname)
-        frame = Frame(
-            interpreter=self,
-            function=module_function,
-            function_ir=module_ir,
-            globals=globals_dict,
-            locals=locals_dict,
-            cells={},
-            block_label=module_ir.entry_label,
-            instr_index=0,
-        )
-        self.run_to_completion(frame)
-        return locals_dict
-
-    def exec(self, globals=None, locals=None):
-        # Execute the top-level module region in a fresh frame.
-        if globals is None:
-            globals = {}
-        if locals is None:
-            locals = globals
-        if "__builtins__" not in globals:
-            globals["__builtins__"] = builtins.__dict__
-
-        globals.setdefault("__name__", self.module_name)
-        module_path = self.module_path
-        if module_path is not None:
-            globals.setdefault("__file__", module_path)
-        # Keep exec()-style behavior here: do not synthesize import-module metadata
-        # such as __package__ or __path__ when executing an arbitrary namespace.
-        globals["__build_class__"] = self.build_class
-        return self.run_module_region(self.module_ir, globals, locals)
-
-    def resolve_absolute_import_name(self, frame, module_name, level):
-        module_name = "" if module_name is None else module_name
-        if level == 0:
-            return module_name
-
-        package_name = frame.globals.get("__package__")
-        if package_name is None:
-            current_name = frame.globals.get("__name__", "")
-            if "__path__" in frame.globals:
-                package_name = current_name
-            else:
-                package_name = current_name.rpartition(".")[0]
-        if not package_name:
-            raise ImportError("attempted relative import with no known parent package")
-        return importlib.util.resolve_name("." * level + module_name, package_name)
-
-    def bind_submodule(self, fullname, module):
-        parent_name, _, child_name = fullname.rpartition(".")
-        if not parent_name:
-            return
-        parent_module = sys.modules.get(parent_name)
-        if parent_module is not None:
-            setattr(parent_module, child_name, module)
-
-    def find_module_spec(self, fullname):
-        parent_name, _, _ = fullname.rpartition(".")
-        search_path = list(self.search_path)
-        if parent_name:
-            parent_module = self.import_absolute_module(parent_name)
-            search_path = getattr(parent_module, "__path__", None)
-            if search_path is None:
-                raise ModuleNotFoundError("No module named %s; %s is not a package" % (fullname, parent_name), name=fullname)
-        return importlib.machinery.PathFinder.find_spec(fullname, search_path)
-
-    def is_ir_source_spec(self, spec):
-        if spec is None or spec.origin in (None, "built-in", "frozen"):
-            return False
-        return isinstance(spec.loader, importlib.machinery.SourceFileLoader) and spec.origin.endswith(".py")
-
-    def load_module_ir(self, path):
-        path = os.path.abspath(path)
-        cached = self.module_ir_cache.get(path)
-        if cached is not None:
-            return cached
-        module_ir = compile_file(new_compiler_state(), path)
-        self.module_ir_cache[path] = module_ir
-        return module_ir
-
-    def load_ir_module_from_spec(self, fullname, spec):
-        existing = sys.modules.get(fullname)
-        if existing is not None:
-            return existing
-
-        module = importlib.util.module_from_spec(spec)
-        if getattr(module, "__file__", None) is not None:
-            module.__file__ = os.path.abspath(module.__file__)
-        if getattr(module, "__path__", None) is not None:
-            module.__path__ = [os.path.abspath(entry) for entry in module.__path__]
-        sys.modules[fullname] = module
-        self.bind_submodule(fullname, module)
-
-        try:
-            module.__dict__.setdefault("__builtins__", builtins.__dict__)
-            module.__dict__["__build_class__"] = self.build_class
-            module_ir = self.load_module_ir(spec.origin)
-            self.run_module_region(module_ir, module.__dict__)
-        except BaseException:
-            if sys.modules.get(fullname) is module:
-                del sys.modules[fullname]
-            raise
-        return module
-
-    def load_python_module_from_spec(self, fullname, spec):
-        existing = sys.modules.get(fullname)
-        if existing is not None:
-            return existing
-
-        module = importlib.util.module_from_spec(spec)
-        if getattr(module, "__file__", None) is not None:
-            module.__file__ = os.path.abspath(module.__file__)
-        if getattr(module, "__path__", None) is not None:
-            module.__path__ = [os.path.abspath(entry) for entry in module.__path__]
-        sys.modules[fullname] = module
-        self.bind_submodule(fullname, module)
-
-        try:
-            if spec.loader is not None:
-                spec.loader.exec_module(module)
-        except BaseException:
-            if sys.modules.get(fullname) is module:
-                del sys.modules[fullname]
-            raise
-        return module
-
-    def import_absolute_module(self, fullname):
-        existing = sys.modules.get(fullname)
-        if existing is not None:
-            return existing
-
-        spec = self.find_module_spec(fullname)
-        if spec is None:
-            return importlib.import_module(fullname)
-        if self.is_ir_source_spec(spec):
-            return self.load_ir_module_from_spec(fullname, spec)
-        return self.load_python_module_from_spec(fullname, spec)
-
-    def ensure_fromlist(self, module, fromlist):
-        if not fromlist or "*" in fromlist:
-            return
-        package_path = getattr(module, "__path__", None)
-        if package_path is None:
-            return
-        for name in fromlist:
-            if hasattr(module, name):
-                continue
-            fullname = "%s.%s" % (module.__name__, name)
-            try:
-                self.import_absolute_module(fullname)
-            except ModuleNotFoundError:
-                continue
-
-    def import_module(self, frame, module_name, fromlist, level):
-        absolute_name = self.resolve_absolute_import_name(frame, module_name, level)
-        module = self.import_absolute_module(absolute_name)
-        self.ensure_fromlist(module, fromlist)
-        if fromlist:
-            return module
-        top_level_name = absolute_name.split(".", 1)[0]
-        return sys.modules.get(top_level_name, module)
-
-    def build_class(self, body_function, name, *bases, **kwargs):
-        # Execute the lowered class body like a function, then hand its namespace to the metaclass.
-        metaclass = kwargs.pop("metaclass", type)
-        namespace = {}
-        body_function.__qualname__ = name
-        body_function.preloaded_locals = {
-            "__module__": body_function.__globals__.get("__name__", "__main__"),
-            "__qualname__": name,
-        }
-        body_function.__call__()
-        class_frame = self.last_completed_frame
-        namespace.update(class_frame.locals)
-        return metaclass(name, bases or (object,), namespace, **kwargs)
-
-    def call_function(self, function, args, kwargs):
-        # Pick the runtime wrapper that matches the code object's generator/coroutine flags.
-        flags = function.region_ir.flags
-        frame = self.make_frame(function, args, kwargs)
-
-        if flags & inspect.CO_ASYNC_GENERATOR:
-            return IRAsyncGenerator(self, frame)
-        if flags & inspect.CO_COROUTINE:
-            return IRCoroutine(self, frame)
-        if flags & inspect.CO_GENERATOR:
-            return IRGenerator(self, frame)
-        return self.run_to_completion(frame)
-
-    def make_frame(self, function, args, kwargs):
-        # Materialize locals and closure cells for one function invocation.
-        locals_dict = self.bind_arguments(function, args, kwargs)
-        locals_dict.update(function.preloaded_locals)
-        cells = dict(function.closure_cells)
-        for name in function.region_ir.cells:
-            if name not in cells:
-                cells[name] = Cell(locals_dict.get(name, _UNSET))
-        return Frame(
-            interpreter=self,
-            function=function,
-            function_ir=function.function_ir,
-            globals=function.globals,
-            locals=locals_dict,
-            cells=cells,
-            block_label=function.function_ir.entry_label,
-            instr_index=0,
-        )
-
-    def bind_arguments(self, function, args, kwargs):
-        # Bind Python arguments using the structural signature recorded on the Region.
-        region = function.region_ir
-        positional = region.argcount
-        posonly = region.posonlyargcount
-        kwonly = region.kwonlyargcount
-        names = list(region.locals[: positional + kwonly])
-        bound = {}
-        kwargs = dict(kwargs)
-
-        positional_names = names[:positional]
-        posonly_names = positional_names[:posonly]
-        kwonly_names = names[positional: positional + kwonly]
-
-        if len(args) > len(positional_names) and region.vararg_name is None:
-            raise TypeError("too many positional arguments for %s" % (function.__qualname__,))
-
-        consumed_positional = positional_names[: min(len(args), len(positional_names))]
-        for name, value in zip(consumed_positional, args):
-            bound[name] = value
-
-        posonly_keyword_names = [name for name in posonly_names if name in kwargs]
-        if posonly_keyword_names:
-            raise TypeError("positional-only arguments passed by keyword for %s: %s" % (function.__qualname__, sorted(posonly_keyword_names)))
-
-        duplicate_names = [name for name in consumed_positional if name in kwargs]
-        if duplicate_names:
-            raise TypeError("multiple values for arguments for %s: %s" % (function.__qualname__, sorted(duplicate_names)))
-
-        for name in positional_names[len(consumed_positional):]:
-            if name in kwargs:
-                bound[name] = kwargs.pop(name)
-
-        if function.defaults:
-            default_names = positional_names[-len(function.defaults):]
-            for name, value in zip(default_names, function.defaults):
-                bound.setdefault(name, value)
-
-        for name in positional_names:
-            if name not in bound:
-                raise TypeError("missing argument %r for %s" % (name, function.__qualname__))
-
-        extra_args = args[len(positional_names):]
-        if region.vararg_name is not None:
-            bound[region.vararg_name] = tuple(extra_args)
-
-        for name in kwonly_names:
-            if name in kwargs:
-                bound[name] = kwargs.pop(name)
-            elif function.kwdefaults and name in function.kwdefaults:
-                bound[name] = function.kwdefaults[name]
-            else:
-                raise TypeError("missing keyword-only argument %r for %s" % (name, function.__qualname__))
-
-        if region.kwarg_name is not None:
-            bound[region.kwarg_name] = dict(kwargs)
-        elif kwargs:
-            raise TypeError("unexpected keyword arguments for %s: %s" % (function.__qualname__, sorted(kwargs)))
-
-        return bound
-
-    def run_to_completion(self, frame):
-        # Fully execute a frame that is not expected to yield.
-        self.last_completed_frame = None
-        event = self.resume_frame(frame, send_value=None)
-        if event[0] != "return":
-            raise RuntimeError("frame yielded unexpectedly: %r" % (event,))
-        self.last_completed_frame = frame
-        return event[1]
-
-    def resume_frame(self, frame, send_value=None):
-        # Drive one frame until it returns or yields.
-        if frame.finished:
-            return ("return", frame.return_value)
-        if frame.block_label is None:
-            frame.block_label = frame.function_ir.entry_label
-        frame.pending_send_value = send_value
-
-        for hook in self.hooks:
-            hook.on_enter_frame(frame)
-
-        try:
-            while not frame.finished:
-                block = self.get_block(frame.function_ir, frame.block_label)
-                if frame.instr_index >= len(block.instructions):
-                    next_label = self.fallthrough_label(frame.function_ir, frame.block_label)
-                    if next_label is None:
-                        frame.finished = True
-                        break
-                    frame.block_label = next_label
-                    frame.instr_index = 0
-                    continue
-
-                instr = block.instructions[frame.instr_index]
-                for hook in self.hooks:
-                    hook.before_instruction(frame, instr)
-
-                try:
-                    event = self.execute_instruction(frame, instr)
-                except BaseException as exc:
-                    for hook in self.hooks:
-                        hook.on_exception(frame, instr, exc)
-                    handled = self.handle_exception(frame, exc)
-                    if handled is None:
-                        frame.current_exception = exc
-                        raise
-                    event = handled
-
-                for hook in self.hooks:
-                    hook.after_instruction(frame, instr, event if event is not None else _UNSET)
-
-                if event is None:
-                    frame.instr_index += 1
-                    continue
-
-                kind = event[0]
-                if kind == "jump":
-                    frame.block_label = event[1]
-                    frame.instr_index = 0
-                    continue
-                if kind == "yield":
-                    frame.instr_index += 1
-                    return event
-                if kind == "return":
-                    frame.finished = True
-                    frame.return_value = event[1]
-                    return event
-                raise RuntimeError("unknown execution event %r" % (event,))
-
-            return ("return", frame.return_value)
-        finally:
-            for hook in self.hooks:
-                hook.on_exit_frame(frame, result=frame.return_value)
-
-    def get_block(self, function_ir, label):
-        for block in function_ir.basic_blocks:
-            if block.label == label:
-                return block
-        raise KeyError("unknown block label %r in %s" % (label, function_ir.name))
-
-    def fallthrough_label(self, function_ir, label):
-        basic_blocks = list(function_ir.basic_blocks)
-        for index, block in enumerate(basic_blocks):
-            if block.label == label and index + 1 < len(basic_blocks):
-                return basic_blocks[index + 1].label
-        return None
-
-    def resolve_value(self, frame, value):
-        if isinstance(value, TemporaryValue):
-            return frame.temps[value]
-        if isinstance(value, BasicBlockLabel):
-            return value
-        if isinstance(value, RegionLabel):
-            return value
-        return value
-
-    def get_child_region(self, function_ir, label):
-        for child_region in function_ir.child_regions:
-            if child_region.label == label:
-                return child_region
-        raise KeyError("unknown child region label %r in %s" % (label, function_ir.name))
-
-    def store_temp(self, frame, temp, value):
-        frame.temps[temp] = value
-        return value
-
-    def execute_instruction(self, frame, instr):
-        # Main interpreter dispatch for one IR instruction.
-        if isinstance(instr, Const):
-            return self.exec_value_instr(frame, instr, instr.value)
-
-        if isinstance(instr, LoadName):
-            value = self.load_var(frame, instr.scope, instr.name)
-            return self.exec_value_instr(frame, instr, value)
-
-        if isinstance(instr, StoreName):
-            self.store_var(frame, instr.scope, instr.name, self.resolve_value(frame, instr.src))
-            return None
-
-        if isinstance(instr, DeleteName):
-            self.delete_var(frame, instr.scope, instr.name)
-            return None
-
-        if isinstance(instr, UnaryOp):
-            return self.exec_value_instr(frame, instr, self.apply_unary(instr.op, self.resolve_value(frame, instr.src)))
-
-        if isinstance(instr, BinaryOp):
-            lhs = self.resolve_value(frame, instr.lhs)
-            rhs = self.resolve_value(frame, instr.rhs)
-            return self.exec_value_instr(frame, instr, self.apply_binary(instr.op, lhs, rhs))
-
-        if isinstance(instr, CompareOp):
-            lhs = self.resolve_value(frame, instr.lhs)
-            rhs = self.resolve_value(frame, instr.rhs)
-            return self.exec_value_instr(frame, instr, self.apply_compare(instr.cmp, lhs, rhs))
-
-        if isinstance(instr, LoadAttr):
-            obj = self.resolve_value(frame, instr.obj)
-            return self.exec_value_instr(frame, instr, getattr(obj, instr.attr_name))
-
-        if isinstance(instr, StoreAttr):
-            setattr(self.resolve_value(frame, instr.obj), instr.attr_name, self.resolve_value(frame, instr.value))
-            return None
-
-        if isinstance(instr, DeleteAttr):
-            delattr(self.resolve_value(frame, instr.obj), instr.attr_name)
-            return None
-
-        if isinstance(instr, LoadItem):
-            obj = self.resolve_value(frame, instr.obj)
-            key = self.resolve_value(frame, instr.key)
-            return self.exec_value_instr(frame, instr, obj[key])
-
-        if isinstance(instr, StoreItem):
-            obj = self.resolve_value(frame, instr.obj)
-            key = self.resolve_value(frame, instr.key)
-            value = self.resolve_value(frame, instr.value)
-            obj[key] = value
-            return None
-
-        if isinstance(instr, DeleteItem):
-            del self.resolve_value(frame, instr.obj)[self.resolve_value(frame, instr.key)]
-            return None
-
-        if isinstance(instr, BuildTuple):
-            built = []
-            for item in instr.items:
-                if isinstance(item, UnpackedTemporaryValue):
-                    built.extend(self.resolve_value(frame, item.value))
-                else:
-                    built.append(self.resolve_value(frame, item))
-            return self.exec_value_instr(frame, instr, tuple(built))
-
-        if isinstance(instr, BuildList):
-            built = []
-            for item in instr.items:
-                if isinstance(item, UnpackedTemporaryValue):
-                    built.extend(self.resolve_value(frame, item.value))
-                else:
-                    built.append(self.resolve_value(frame, item))
-            return self.exec_value_instr(frame, instr, built)
-
-        if isinstance(instr, BuildSet):
-            built = set()
-            for item in instr.items:
-                if isinstance(item, UnpackedTemporaryValue):
-                    built.update(self.resolve_value(frame, item.value))
-                else:
-                    built.add(self.resolve_value(frame, item))
-            return self.exec_value_instr(frame, instr, built)
-
-        if isinstance(instr, BuildMap):
-            built = {}
-            for key, value in instr.items:
-                if key is None:
-                    built.update(dict(self.resolve_value(frame, value)))
-                else:
-                    built[self.resolve_value(frame, key)] = self.resolve_value(frame, value)
-            return self.exec_value_instr(frame, instr, built)
-
-        if isinstance(instr, BuildSlice):
-            return self.exec_value_instr(
-                frame,
-                instr,
-                slice(
-                    self.resolve_value(frame, instr.start),
-                    self.resolve_value(frame, instr.stop),
-                    None if instr.step is None else self.resolve_value(frame, instr.step),
-                ),
-            )
-
-        if isinstance(instr, BuildString):
-            return self.exec_value_instr(frame, instr, "".join(str(self.resolve_value(frame, part)) for part in instr.parts))
-
-        if isinstance(instr, FormatValue):
-            value = self.resolve_value(frame, instr.value)
-            if instr.conversion == "repr":
-                value = repr(value)
-            elif instr.conversion == "ascii":
-                value = ascii(value)
-            else:
-                value = str(value)
-            if instr.spec is not None:
-                value = format(value, self.resolve_value(frame, instr.spec))
-            return self.exec_value_instr(frame, instr, value)
-
-        if isinstance(instr, Unpack):
-            values = list(self.resolve_value(frame, instr.src))
-            if instr.star_index is None:
-                if len(values) != len(instr.dsts):
-                    raise ValueError("unpack mismatch")
-                for dst, value in zip(instr.dsts, values):
-                    frame.temps[dst] = value
-                return None
-            if instr.star_index < 0 or instr.star_index >= len(instr.dsts):
-                raise ValueError("invalid unpack star index")
-            before_count = instr.star_index
-            after_count = len(instr.dsts) - before_count - 1
-            if len(values) < before_count + after_count:
-                raise ValueError("unpack mismatch")
-            for dst, value in zip(instr.dsts[:before_count], values[:before_count]):
-                frame.temps[dst] = value
-            frame.temps[instr.dsts[instr.star_index]] = values[before_count: len(values) - after_count]
-            for dst, value in zip(instr.dsts[before_count + 1 :], values[len(values) - after_count:]):
-                frame.temps[dst] = value
-            return None
-
-        if isinstance(instr, Call):
-            callee = self.resolve_value(frame, instr.callee)
-            args = []
-            for arg in instr.args:
-                if isinstance(arg, UnpackedTemporaryValue):
-                    args.extend(self.resolve_value(frame, arg.value))
-                else:
-                    args.append(self.resolve_value(frame, arg))
-            kwargs = {}
-            for name, value in instr.kwargs:
-                resolved = self.resolve_value(frame, value)
-                if name is None:
-                    for key, item in dict(resolved).items():
-                        if key in kwargs:
-                            raise TypeError("multiple values for keyword argument %r" % (key,))
-                        kwargs[key] = item
-                else:
-                    if name in kwargs:
-                        raise TypeError("multiple values for keyword argument %r" % (name,))
-                    kwargs[name] = resolved
-            return self.exec_value_instr(frame, instr, callee(*args, **kwargs))
-
-        if isinstance(instr, ImportName):
-            module = self.import_module(frame, instr.module, list(instr.fromlist), instr.level)
-            return self.exec_value_instr(frame, instr, module)
-
-        if isinstance(instr, ImportFrom):
-            module_obj = self.resolve_value(frame, instr.module_obj)
-            return self.exec_value_instr(frame, instr, getattr(module_obj, instr.name))
-
-        if isinstance(instr, ImportStar):
-            frame.locals.update(vars(self.resolve_value(frame, instr.module_obj)))
-            return None
-
-        if isinstance(instr, MakeFunction):
-            region = self.get_child_region(frame.function_ir, instr.code)
-            closure = {}
-            for name in region.freevars:
-                if name in frame.cells:
-                    closure[name] = frame.cells[name]
-            child_name = region.name.split("#", 1)[0]
-            parent_qualname = frame.function.__qualname__
-            if frame.function_ir.name == "<module>":
-                qualname = child_name
-            elif frame.function_ir.is_class:
-                qualname = "%s.%s" % (parent_qualname, child_name)
-            else:
-                qualname = "%s.<locals>.%s" % (parent_qualname, child_name)
-            fn = IRFunction(self, region, frame.globals, closure_cells=closure, qualname=qualname)
-            if instr.defaults:
-                fn.defaults = tuple(self.resolve_value(frame, value) for value in instr.defaults)
-                fn.__defaults__ = fn.defaults
-            if instr.kwdefaults:
-                fn.kwdefaults = {name: self.resolve_value(frame, value) for name, value in instr.kwdefaults}
-                fn.__kwdefaults__ = fn.kwdefaults
-            return self.exec_value_instr(frame, instr, fn)
-
-        if isinstance(instr, BuildClass):
-            body = self.resolve_value(frame, instr.body_func)
-            name = self.resolve_value(frame, instr.name)
-            bases = [self.resolve_value(frame, base) for base in instr.bases]
-            keywords = {name: self.resolve_value(frame, value) for name, value in instr.keywords}
-            return self.exec_value_instr(frame, instr, self.build_class(body, name, *bases, **keywords))
-
-        if isinstance(instr, GetIter):
-            return self.exec_value_instr(frame, instr, iter(self.resolve_value(frame, instr.iterable)))
-
-        if isinstance(instr, ForIter):
-            iterator = self.resolve_value(frame, instr.iter_obj)
-            try:
-                value = next(iterator)
-            except StopIteration:
-                return ("jump", instr.exit_label)
-            frame.temps[instr.value_dst] = value
-            return ("jump", instr.body_label)
-
-        if isinstance(instr, GetAIter):
-            return self.exec_value_instr(frame, instr, self.resolve_value(frame, instr.iterable).__aiter__())
-
-        if isinstance(instr, GetANext):
-            return self.exec_value_instr(frame, instr, self.resolve_value(frame, instr.aiter).__anext__())
-
-        if isinstance(instr, GetAwaitable):
-            value = self.resolve_value(frame, instr.value)
-            return self.exec_value_instr(frame, instr, value if inspect.isawaitable(value) else value)
-
-        if isinstance(instr, YieldValue):
-            yielded = self.resolve_value(frame, instr.value)
-            sent_value = None if frame.pending_send_value is _UNSET else frame.pending_send_value
-            self.store_temp(frame, instr.dst, sent_value)
-            frame.pending_send_value = _UNSET
-            return ("yield", yielded)
-
-        if isinstance(instr, YieldFrom):
-            yielded = self.resolve_value(frame, instr.value)
-            self.store_temp(frame, instr.dst, None)
-            return ("yield", yielded)
-
-        if isinstance(instr, AwaitValue):
-            value = self.resolve_value(frame, instr.value)
-            return self.exec_value_instr(frame, instr, self.await_sync(value))
-
-        if isinstance(instr, CurrentException):
-            return self.exec_value_instr(frame, instr, frame.current_exception)
-
-        if isinstance(instr, Raise):
-            exc = self.normalize_exception_for_raise(self.resolve_value(frame, instr.exc))
-            if instr.cause is not None:
-                cause = self.normalize_exception_for_raise(self.resolve_value(frame, instr.cause), allow_none=True)
-                exc.__cause__ = cause
-                exc.__suppress_context__ = True
-            raise exc
-
-        if isinstance(instr, Reraise):
-            if frame.current_exception is None:
-                raise RuntimeError("no current exception to reraise")
-            raise frame.current_exception
-
-        if isinstance(instr, CheckExcMatch):
-            exc = self.resolve_value(frame, instr.exc)
-            typ = self.resolve_value(frame, instr.typ)
-            matched = isinstance(exc, typ) if isinstance(typ, type) else False
-            return self.exec_value_instr(frame, instr, matched)
-
-        if isinstance(instr, CheckEGMatch):
-            return self.exec_value_instr(frame, instr, False)
-
-        if isinstance(instr, PushTry):
-            frame.try_stack.append({
-                "except_label": instr.except_label,
-                "finally_label": instr.finally_label,
-            })
-            return None
-
-        if isinstance(instr, PopTry):
-            if frame.try_stack:
-                frame.try_stack.pop()
-            return None
-
-        if isinstance(instr, ClearException):
-            frame.current_exception = None
-            return None
-
-        if isinstance(instr, EndFinally):
-            return self.end_finally(frame)
-
-        if isinstance(instr, Escape):
-            return self.handle_escape(frame, instr.target)
-
-        if isinstance(instr, Jump):
-            return ("jump", instr.target)
-
-        if isinstance(instr, Branch):
-            cond = self.resolve_value(frame, instr.cond)
-            return ("jump", instr.true_label if cond else instr.false_label)
-
-        if isinstance(instr, Return):
-            value = self.resolve_value(frame, instr.value)
-            frame.current_exception = None
-            return self.handle_return(frame, value)
-
-        if isinstance(instr, MatchMapping):
-            value = self.resolve_value(frame, instr.value)
-            return self.exec_value_instr(frame, instr, isinstance(value, Mapping))
-
-        if isinstance(instr, MatchSequence):
-            value = self.resolve_value(frame, instr.value)
-            return self.exec_value_instr(frame, instr, isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)))
-
-        if isinstance(instr, MatchKeys):
-            mapping = self.resolve_value(frame, instr.mapping)
-            keys = self.resolve_value(frame, instr.keys)
-            try:
-                result = tuple(mapping[key] for key in keys)
-            except Exception:
-                result = None
-            return self.exec_value_instr(frame, instr, result)
-
-        if isinstance(instr, MatchClass):
-            value = self.resolve_value(frame, instr.value)
-            cls = self.resolve_value(frame, instr.cls)
-            return self.exec_value_instr(frame, instr, isinstance(value, cls))
-
-        raise NotImplementedError("unsupported IR instruction: %r" % (instr,))
-
-    def exec_value_instr(self, frame, instr, value):
-        self.store_temp(frame, instr.dst, value)
-        return None
-
-    def handle_exception(self, frame, exception):
-        # Redirect an exception to the nearest active synthetic try target, if any.
-        frame.current_exception = exception
-        for index in range(len(frame.try_stack) - 1, -1, -1):
-            entry = frame.try_stack[index]
-            target = entry.get("except_label") or entry.get("finally_label")
-            if target is None:
-                continue
-            del frame.try_stack[index:]
-            return ("jump", target)
-        return None
-
-    def handle_return(self, frame, value):
-        for index in range(len(frame.try_stack) - 1, -1, -1):
-            entry = frame.try_stack[index]
-            target = entry.get("finally_label")
-            if target is None:
-                continue
-            frame.pending_return_value = value
-            del frame.try_stack[index:]
-            return ("jump", target)
-        frame.pending_return_value = _UNSET
-        frame.pending_jump_label = _UNSET
-        return ("return", value)
-
-    def handle_escape(self, frame, target_label):
-        # `Escape` is used for structured `break` / `continue`. It behaves like a jump, except
-        # that it must thread through pending finally blocks before reaching its destination.
-        for index in range(len(frame.try_stack) - 1, -1, -1):
-            entry = frame.try_stack[index]
-            finally_label = entry.get("finally_label")
-            if finally_label is None:
-                continue
-            frame.pending_jump_label = target_label
-            del frame.try_stack[index:]
-            return ("jump", finally_label)
-        frame.pending_jump_label = _UNSET
-        frame.pending_return_value = _UNSET
-        return ("jump", target_label)
-
-    def end_finally(self, frame):
-        # Finish a finally region by resuming the highest-priority pending control effect:
-        # exception, return, or structured jump.
-        if frame.current_exception is not None:
-            exc = frame.current_exception
-            handled = self.handle_exception(frame, exc)
-            if handled is not None:
-                return handled
-            raise exc
-        if frame.pending_return_value is not _UNSET:
-            value = frame.pending_return_value
-            frame.pending_return_value = _UNSET
-            return self.handle_return(frame, value)
-        if frame.pending_jump_label is not _UNSET:
-            label = frame.pending_jump_label
-            frame.pending_jump_label = _UNSET
-            return self.handle_escape(frame, label)
-        return None
-
-    def await_sync(self, value):
-        if isinstance(value, IRCoroutine):
-            iterator = value.__await__()
-            send_value = None
-            while True:
-                try:
-                    yielded = iterator.send(send_value)
-                except StopIteration as stop:
-                    return stop.value
-                send_value = self.await_sync(yielded)
-        if inspect.isawaitable(value):
-            iterator = value.__await__()
-            send_value = None
-            while True:
-                try:
-                    yielded = iterator.send(send_value)
-                except StopIteration as stop:
-                    return stop.value
-                if inspect.isawaitable(yielded) or isinstance(yielded, IRCoroutine):
-                    send_value = self.await_sync(yielded)
-                else:
-                    send_value = yielded
-        return value
-
-    def load_var(self, frame, scope, name):
-        # Variable lookup follows the explicit scope chosen during lowering.
-        if scope == Scope.LOCAL:
-            if name in frame.locals:
-                return frame.locals[name]
-            if name in frame.cells and frame.cells[name].value is not _UNSET:
-                return frame.cells[name].value
-            raise NameError(name)
-
-        if scope == Scope.CELL:
-            if name in frame.cells and frame.cells[name].value is not _UNSET:
-                return frame.cells[name].value
-            raise NameError(name)
-
-        if scope == Scope.GLOBAL:
-            if name in frame.globals:
-                return frame.globals[name]
-            return self.load_builtin(frame, name)
-
-        if scope == Scope.NAME:
-            if name in frame.locals:
-                return frame.locals[name]
-            if name in frame.globals:
-                return frame.globals[name]
-            return self.load_builtin(frame, name)
-
-        raise NotImplementedError("unknown scope %r" % (scope,))
-
-    def store_var(self, frame, scope, name, value):
-        if scope == Scope.GLOBAL:
-            frame.globals[name] = value
-            return
-        if scope == Scope.CELL:
-            frame.cells.setdefault(name, Cell())
-            frame.cells[name].value = value
-            return
-        frame.locals[name] = value
-
-    def delete_var(self, frame, scope, name):
-        if scope == Scope.GLOBAL:
-            del frame.globals[name]
-            return
-        if scope == Scope.CELL:
-            if name in frame.cells:
-                frame.cells[name].value = _UNSET
-                return
-            raise NameError(name)
-        del frame.locals[name]
-
-    def load_builtin(self, frame, name):
-        builtins_obj = frame.globals.get("__builtins__", builtins.__dict__)
-        if isinstance(builtins_obj, dict):
-            if name in builtins_obj:
-                return builtins_obj[name]
-        else:
-            if hasattr(builtins_obj, name):
-                return getattr(builtins_obj, name)
-        raise NameError(name)
-
-    def normalize_exception_for_raise(self, value, allow_none=False):
-        # Match Python's rule that `raise` accepts an exception instance or exception class.
-        if allow_none and value is None:
-            return None
-        if isinstance(value, BaseException):
-            return value
-        if isinstance(value, type) and issubclass(value, BaseException):
-            return value()
-        raise TypeError("exceptions must derive from BaseException")
-
-    def apply_unary(self, op, value):
-        if op == "+":
-            return +value
-        if op == "-":
-            return -value
-        if op == "not":
-            return not value
-        if op == "~":
-            return ~value
-        raise NotImplementedError("unsupported unary op %r" % (op,))
-
-    def apply_binary(self, op, lhs, rhs):
-        table = {
-            "+": operator.add,
-            "-": operator.sub,
-            "*": operator.mul,
-            "/": operator.truediv,
-            "//": operator.floordiv,
-            "%": operator.mod,
-            "**": operator.pow,
-            "<<": operator.lshift,
-            ">>": operator.rshift,
-            "&": operator.and_,
-            "|": operator.or_,
-            "^": operator.xor,
-            "@": operator.matmul,
-        }
-        if op in table:
-            return table[op](lhs, rhs)
-        raise NotImplementedError("unsupported binary op %r" % (op,))
-
-    def apply_compare(self, cmp, lhs, rhs):
-        table = {
-            "<": operator.lt,
-            "<=": operator.le,
-            "==": operator.eq,
-            "!=": operator.ne,
-            ">": operator.gt,
-            ">=": operator.ge,
-            "is": operator.is_,
-            "is not": operator.is_not,
-            "in": lambda a, b: a in b,
-            "not in": lambda a, b: a not in b,
-        }
-        if cmp not in table:
-            raise NotImplementedError("unsupported compare op %r" % (cmp,))
-        return table[cmp](lhs, rhs)
 

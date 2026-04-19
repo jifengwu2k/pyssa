@@ -301,6 +301,19 @@ def validation_summary(orders):
     return "ok"
 
 
+def tuple_except_case(kind):
+    try:
+        if kind == "key":
+            return {}["missing"]
+        if kind == "value":
+            raise ValueError("bad value")
+        raise RuntimeError("bad runtime")
+    except (KeyError, ValueError) as exc:
+        return type(exc).__name__
+    except RuntimeError as exc:
+        return type(exc).__name__
+
+
 async def plus_one(value):
     return value + 1
 
@@ -393,3 +406,8 @@ VALIDATION_SAMPLE = [
     {"customer": 42, "lines": [{"sku": "tea", "quantity": 1}]},
     {"customer": "missing-lines", "lines": []},
 ]
+TUPLE_EXCEPT_RESULTS = (
+    tuple_except_case("key"),
+    tuple_except_case("value"),
+    tuple_except_case("runtime"),
+)

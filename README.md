@@ -124,7 +124,7 @@ These are not lowered as standalone nodes, but they are supported as payloads wh
 | `Raise` | Supported | explicit exception, bare `raise`, and `raise ... from ...` |
 | `Try` | Supported | `except` / `else` / `finally` |
 | `TryStar` | Partial | `except*` lowering is implemented, but exception-group semantics are still incomplete |
-| `Assert` | Not yet | |
+| `Assert` | Supported | lowers to a conditional `AssertionError` raise |
 | `Import` | Supported | |
 | `ImportFrom` | Supported | includes `import *` |
 | `Global` | Supported | via scope analysis |
