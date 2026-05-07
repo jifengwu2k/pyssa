@@ -8,15 +8,96 @@ This code expects:
 - `attrs`
 - `cowlist`
 
-## Quick start
+## End-to-end example
 
-```bash
-python compile_to_ir.py ir_test_program.py
-python compare_exec_with_ir.py ir_test_program.py
-python cyclomatic_complexity.py ir_test_program.py
+```python
+import sys
+
+from pyssa.compiler import compile_source, new_compiler_state
+from pyssa.ir import print_region_ir
+from pyssa.interpreter import Interpreter
+
+# 1. Compile Python source to IR
+source = '''
+def make_adder(n=0):
+    def adder(x, y=1):
+        return x + y + n
+    return adder
+
+f = make_adder(10)
+result = f(5)'''
+module_ir = compile_source(new_compiler_state(), source, path='<example>')
+
+# 2. Inspect the IR
+print_region_ir(module_ir)
+
+# 3. Create an interpreter with explicit search paths and run the module
+interp = Interpreter(search_path=list(sys.path))
+namespace = interp.run_module(module_ir, globals={})
+
+# 4. Inspect results
+print(namespace["result"])   # 16
+
+# Function is a pure data object — use Interpreter.call to invoke it:
+f = namespace["f"]
+print(f.__defaults__)        # (1,)
+print(interp.call(f, (100,), {}))  # 111
 ```
 
-The `cyclomatic_complexity.py` script is a small example of a source-analysis tool made possible by pyssa's explicit nested `Region` CFG IR: it compiles Python to IR, walks each region, and reports cyclomatic complexity structurally from the region CFG.
+## Stepping through instructions
+
+`Frame.resume()` drives execution to completion (or the next yield). For
+instruction-level stepping, `dispatch_current_instruction` handles
+everything internally — block fallthrough, PC advancement, jump
+application, and exception dispatch:
+
+```python
+import sys
+
+from pyssa.compiler import compile_source, new_compiler_state
+from pyssa.interpreter import Interpreter
+
+source = '''
+def square(x):
+    return x * x
+'''
+module_ir = compile_source(new_compiler_state(), source, path='<step>')
+interp = Interpreter(search_path=list(sys.path))
+namespace = interp.run_module(module_ir, globals={})
+
+fn = namespace["square"]
+frame = interp.make_frame(fn, (7,), {})
+
+# Step one instruction at a time
+while not frame.finished:
+    instr = frame.get_current_instruction()
+    print(f"L{frame.block_label.index}:{frame.instr_index}  {type(instr).__name__}")
+
+    event = frame.dispatch_current_instruction()
+    if event is not None:
+        break  # returned or yielded
+
+print(f"returned: {event.value}")  # 49
+```
+
+## Architecture
+
+pyssa's runtime is split into three classes that mirror CPython's structure:
+
+| pyssa | CPython | Role |
+|---|---|---|
+| `Function` | `PyFunctionObject` | Pure data: compiled IR, globals, closure, defaults |
+| `Interpreter` | `PyInterpreterState` | Shared session state: module caches, search path, execution entry points |
+| `Frame` | `PyFrameObject` | Per-invocation execution state: locals, temps, program counter |
+
+Execution flows through a single entry point: `Interpreter.call(fn, args, kwargs)`.
+
+The IR is defined in terms of a small set of core classes:
+
+- **`Region`** — a named executable unit with its own CFG: labeled `BasicBlock`s, nested `child_regions`, and metadata (`locals`, `cells`, `freevars`, argument descriptors, exception handlers).
+- **`BasicBlock`** — a straight-line sequence of `Instruction`s with a `BasicBlockLabel`.
+- **`Instruction`** — two families: `ValueInstruction` (produces a result in `dst: TemporaryValue`) and `EffectInstruction` (side effects only). Concrete instructions cover constants, name/attr/subscript access, arithmetic/comparison, calls, control flow (`Jump`, `Branch`, `Return`), imports, function/class construction, iteration, exceptions, pattern matching, and more.
+- **Operands** — `TemporaryValue` (SSA-style temporaries), `BasicBlockLabel`, `RegionLabel`, `SyntheticLocal` (compiler-generated locals), and `UnpackedTemporaryValue` (splat markers).
 
 ## Case study: cyclomatic complexity three ways
 

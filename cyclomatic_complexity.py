@@ -21,7 +21,8 @@ import json
 import sys
 from typing import Dict, Sequence, Set, Tuple
 
-from pyssa import Branch, Escape, ForIter, Jump, Region, compile_file, new_compiler_state
+from pyssa.ir import Branch, Escape, ForIter, Jump, Region
+from pyssa.compiler import compile_file, new_compiler_state
 
 
 def block_successors(block) -> Tuple[object, ...]:
