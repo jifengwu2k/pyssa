@@ -7,8 +7,6 @@ structured as explicit lowering functions with explicit parameters
 rather than a large class-based visitor.
 """
 
-from __future__ import annotations
-
 import __future__
 import ast
 import builtins
@@ -314,7 +312,7 @@ def compile_region_node(
 ) -> Region:
     """Dispatch to the appropriate region compiler for this AST node."""
     if isinstance(node, ast.GeneratorExp):
-        return _compile_genexpr_region(
+        return compile_genexpr_region(
             state,
             node=node,
             table=table,
@@ -325,7 +323,7 @@ def compile_region_node(
             label=label,
         )
     if isinstance(node, ast.Lambda):
-        return _compile_lambda_region(
+        return compile_lambda_region(
             state,
             node=node,
             table=table,
@@ -335,7 +333,7 @@ def compile_region_node(
             is_class=is_class,
             label=label,
         )
-    return _compile_region_ast(
+    return compile_region_ast(
         state,
         node=node,
         table=table,
@@ -347,7 +345,7 @@ def compile_region_node(
     )
 
 
-def _compile_region_ast(
+def compile_region_ast(
     state: CompilerState,
     node: ast.AST,
     table: Any,
@@ -409,7 +407,7 @@ def _compile_region_ast(
     return region
 
 
-def _compile_genexpr_region(
+def compile_genexpr_region(
     state: CompilerState,
     node: ast.GeneratorExp,
     table: Any,
@@ -473,7 +471,7 @@ def _compile_genexpr_region(
     return region
 
 
-def _compile_lambda_region(
+def compile_lambda_region(
     state: CompilerState,
     node: ast.Lambda,
     table: Any,

@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 import builtins
-from collections.abc import Mapping, Sequence
+from collections import abc
+import contextlib
 import importlib
 import importlib.machinery
 import importlib.util
@@ -9,12 +8,32 @@ import inspect
 import operator
 import os
 import sys
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import types
+from typing import (
+    Any,
+    AsyncGenerator,
+    Coroutine,
+    Dict,
+    Generator,
+    Iterable,
+    ItemsView,
+    KeysView,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    ValuesView,
+)
 
 import attrs
+from typing_extensions import Protocol
 
 from pyssa.ir import (
     AwaitValue,
+    BasicBlock,
     BasicBlockLabel,
     BinaryOp,
     Branch,
@@ -46,6 +65,7 @@ from pyssa.ir import (
     ImportFrom,
     ImportName,
     ImportStar,
+    Instruction,
     Jump,
     LoadAttr,
     LoadItem,
@@ -104,6 +124,32 @@ class ReturnEvent:
     """Return a value from the current frame."""
 
     value: Any
+
+
+FrameT = TypeVar("FrameT", bound="BaseFrame")
+
+
+class Namespace(Protocol):
+    def __contains__(self, key: str) -> bool: ...
+
+    def __getitem__(self, key: str) -> Any: ...
+
+    def __setitem__(self, key: str, value: Any) -> None: ...
+
+    def __delitem__(self, key: str) -> None: ...
+
+    def get(self, key: str, default: Any = None) -> Any: ...
+
+    def setdefault(self, key: str, default: Any = None) -> Any: ...
+
+    def items(self) -> Iterable[Tuple[str, Any]]: ...
+
+
+ModuleSpec = importlib.machinery.ModuleSpec
+ControlEvent = Union[JumpEvent, ReturnEvent]
+DispatchEvent = Union[JumpEvent, YieldEvent, ReturnEvent]
+StepEvent = Union[YieldEvent, ReturnEvent]
+TryStackEntry = Dict[str, Optional[BasicBlockLabel]]
 
 
 # ---------------------------------------------------------------------------
@@ -290,19 +336,22 @@ class Module:
     def setdefault(self, key: str, default: Any = None) -> Any:
         return self._dict.setdefault(key, default)
 
-    def keys(self):
+    def keys(self) -> KeysView[str]:
         return self._dict.keys()
 
-    def values(self):
+    def values(self) -> ValuesView[Any]:
         return self._dict.values()
 
-    def items(self):
+    def items(self) -> ItemsView[str, Any]:
         return self._dict.items()
 
 
 # ---------------------------------------------------------------------------
 # Function — pure data, no execution logic
 # ---------------------------------------------------------------------------
+
+
+ModuleValue = Union[Module, types.ModuleType]
 
 
 class Function:
@@ -314,7 +363,7 @@ class Function:
     def __init__(
         self,
         region_ir: Region,
-        globals_dict: Dict[str, Any],
+        globals_dict: Namespace,
         closure_cells: Optional[Dict[str, Cell]] = None,
         qualname: Optional[str] = None,
         preloaded_locals: Optional[Dict[str, Any]] = None,
@@ -335,7 +384,7 @@ class Function:
         self.__qualname__ = qualname or self.__name__
         self.__module__ = globals_dict.get("__name__", "__main__")
 
-    def _get_child_region(self, label: RegionLabel) -> Region:
+    def get_child_region(self, label: RegionLabel) -> Region:
         """Look up a child region by its label."""
         for child_region in self.region_ir.child_regions:
             if child_region.label == label:
@@ -361,18 +410,34 @@ class Interpreter:
         self,
         search_path: Optional[List[str]] = None,
         module_ir_cache: Optional[Dict[str, Region]] = None,
-        module_cache: Optional[Dict[str, Any]] = None,
+        module_cache: Optional[Dict[str, ModuleValue]] = None,
     ) -> None:
         self.search_path = search_path or []
         self.module_ir_cache = module_ir_cache or {}
         self.module_cache = module_cache or {}
+        self._frame_class_stack: List[Type["BaseFrame"]] = []
+
+    def current_frame_class(self) -> Type["BaseFrame"]:
+        if self._frame_class_stack:
+            return self._frame_class_stack[-1]
+        return Frame
+
+    @contextlib.contextmanager
+    def use_frame_class(
+        self, frame_class: Type["BaseFrame"]
+    ) -> Generator[None, None, None]:
+        self._frame_class_stack.append(frame_class)
+        try:
+            yield
+        finally:
+            self._frame_class_stack.pop()
 
     # ------------------------------------------------------------------
     # Module import machinery
     # ------------------------------------------------------------------
 
-    def _resolve_absolute_import_name(
-        self, globals: Any, module_name: Optional[str], level: int
+    def resolve_absolute_import_name(
+        self, globals: Namespace, module_name: Optional[str], level: int
     ) -> str:
         module_name = "" if module_name is None else module_name
         if level == 0:
@@ -392,27 +457,27 @@ class Interpreter:
 
     def import_module(
         self,
-        globals: Any,
+        globals: Namespace,
         module_name: Optional[str],
-        fromlist: List[str],
+        fromlist: Sequence[str],
         level: int,
-    ) -> Any:
+    ) -> ModuleValue:
         """Full filesystem module resolution (absolute + relative)."""
-        absolute_name = self._resolve_absolute_import_name(
+        absolute_name = self.resolve_absolute_import_name(
             globals, module_name, level
         )
-        module = self._import_absolute_module(absolute_name)
-        self._ensure_fromlist(module, fromlist)
+        module = self.import_absolute_module(absolute_name)
+        self.ensure_fromlist(module, fromlist)
         if fromlist:
             return module
         top_level_name = absolute_name.split(".", 1)[0]
         return self.module_cache.get(top_level_name, module)
 
-    def _find_module_spec(self, fullname: str) -> Optional[Any]:
+    def find_module_spec(self, fullname: str) -> Optional[ModuleSpec]:
         parent_name, _, _ = fullname.rpartition(".")
         search_path = list(self.search_path)
         if parent_name:
-            parent_module = self._import_absolute_module(parent_name)
+            parent_module = self.import_absolute_module(parent_name)
             search_path = getattr(parent_module, "__path__", None)
             if search_path is None:
                 raise ModuleNotFoundError(
@@ -422,7 +487,7 @@ class Interpreter:
                 )
         return importlib.machinery.PathFinder.find_spec(fullname, search_path)
 
-    def _load_module_ir(self, path: str) -> Region:
+    def load_module_ir(self, path: str) -> Region:
         path = os.path.abspath(path)
         cached = self.module_ir_cache.get(path)
         if cached is not None:
@@ -431,7 +496,7 @@ class Interpreter:
         self.module_ir_cache[path] = module_ir
         return module_ir
 
-    def _bind_submodule(self, fullname: str, module: Any) -> None:
+    def bind_submodule(self, fullname: str, module: ModuleValue) -> None:
         parent_name, _, child_name = fullname.rpartition(".")
         if not parent_name:
             return
@@ -439,7 +504,7 @@ class Interpreter:
         if parent is not None:
             setattr(parent, child_name, module)
 
-    def _load_ir_module_from_spec(self, fullname: str, spec: Any) -> Module:
+    def load_ir_module_from_spec(self, fullname: str, spec: ModuleSpec) -> Module:
         existing = self.module_cache.get(fullname)
         if existing is not None:
             return existing
@@ -453,18 +518,20 @@ class Interpreter:
         )
         module = Module(fullname, file, pkg, pkg_path)
         self.module_cache[fullname] = module
-        self._bind_submodule(fullname, module)
+        self.bind_submodule(fullname, module)
         try:
             module.setdefault("__builtins__", builtins.__dict__)
             module["__build_class__"] = self.build_class
-            module_ir = self._load_module_ir(origin)
+            module_ir = self.load_module_ir(origin)
             self.run_module(module_ir, module)
         except BaseException:
             del self.module_cache[fullname]
             raise
         return module
 
-    def _load_python_module_from_spec(self, fullname: str, spec: Any) -> Any:
+    def load_python_module_from_spec(
+        self, fullname: str, spec: ModuleSpec
+    ) -> types.ModuleType:
         existing = self.module_cache.get(fullname)
         if existing is not None:
             return existing
@@ -486,20 +553,20 @@ class Interpreter:
             raise
         return module
 
-    def _import_absolute_module(self, fullname: str) -> Any:
+    def import_absolute_module(self, fullname: str) -> ModuleValue:
         existing = self.module_cache.get(fullname)
         if existing is not None:
             return existing
-        spec = self._find_module_spec(fullname)
+        spec = self.find_module_spec(fullname)
         if spec is None:
             module = importlib.import_module(fullname)
             self.module_cache[fullname] = module
             return module
         if is_ir_source_spec(spec):
-            return self._load_ir_module_from_spec(fullname, spec)
-        return self._load_python_module_from_spec(fullname, spec)
+            return self.load_ir_module_from_spec(fullname, spec)
+        return self.load_python_module_from_spec(fullname, spec)
 
-    def _ensure_fromlist(self, module: Any, fromlist: List[str]) -> None:
+    def ensure_fromlist(self, module: ModuleValue, fromlist: Sequence[str]) -> None:
         if not fromlist or "*" in fromlist:
             return
         package_path = getattr(module, "__path__", None)
@@ -510,7 +577,7 @@ class Interpreter:
                 continue
             fullname = "%s.%s" % (module.__name__, name)
             try:
-                self._import_absolute_module(fullname)
+                self.import_absolute_module(fullname)
             except ModuleNotFoundError:
                 continue
 
@@ -524,9 +591,10 @@ class Interpreter:
         args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
         *,
-        locals: Any = None,
-    ) -> Frame:
-        """Materialize a ``Frame`` for one function invocation.
+        locals: Optional[Namespace] = None,
+        frame_class: Optional[Type["BaseFrame"]] = None,
+    ) -> "BaseFrame":
+        """Materialize a frame for one function invocation.
 
         When *locals* is given it is used directly as the frame's
         locals namespace (class bodies).  Otherwise arguments are
@@ -534,13 +602,19 @@ class Interpreter:
         """
         region_ir = function.region_ir
         if locals is None:
-            locals = bind_arguments(function, args, kwargs)
-            locals.update(function.preloaded_locals)
+            if region_ir.name == "<module>":
+                locals = function.globals_dict
+            else:
+                bound_locals = bind_arguments(function, args, kwargs)
+                bound_locals.update(function.preloaded_locals)
+                locals = bound_locals
         cells = dict(function.closure_cells)
         for name in region_ir.cells:
             if name not in cells:
                 cells[name] = Cell(locals.get(name, _UNSET))
-        return Frame(
+        if frame_class is None:
+            frame_class = self.current_frame_class()
+        return frame_class(
             interpreter=self,
             function=function,
             function_ir=region_ir,
@@ -557,30 +631,38 @@ class Interpreter:
         args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
         *,
-        locals: Any = None,
+        locals: Optional[Namespace] = None,
+        frame_class: Optional[Type["BaseFrame"]] = None,
     ) -> Any:
         """Invoke *function* and return its result.
 
         Generator / coroutine / async-generator dispatch is handled
         here so that callers always get a Python-idiomatic result.
         """
-        frame = self.make_frame(function, args, kwargs, locals=locals)
+        frame = self.make_frame(
+            function,
+            args,
+            kwargs,
+            locals=locals,
+            frame_class=frame_class,
+        )
         flags = function.region_ir.flags
         if flags & inspect.CO_ASYNC_GENERATOR:
-            return frame._make_async_generator_object()
+            return frame.make_async_generator_object()
         if flags & inspect.CO_COROUTINE:
-            return frame._make_coroutine_object()
+            return frame.make_coroutine_object()
         if flags & inspect.CO_GENERATOR:
-            return frame._make_generator_object()
+            return frame.make_generator_object()
         return frame.run_to_completion()
 
     def run_module(
         self,
         module_ir: Region,
-        globals: Any,
-        locals: Any = None,
+        globals: Namespace,
+        locals: Optional[Namespace] = None,
         qualname: str = "<module>",
-    ) -> Any:
+        frame_class: Optional[Type["BaseFrame"]] = None,
+    ) -> Namespace:
         """Execute a top-level module ``Region``."""
         if locals is None:
             locals = globals
@@ -592,7 +674,13 @@ class Interpreter:
         locals.setdefault("__name__", qualname)
         locals.setdefault("__builtins__", builtins.__dict__)
         locals["__build_class__"] = self.build_class
-        frame = self.make_frame(module_function, (), {}, locals=locals)
+        frame = self.make_frame(
+            module_function,
+            (),
+            {},
+            locals=locals,
+            frame_class=frame_class,
+        )
         frame.run_to_completion()
         return locals
 
@@ -641,7 +729,7 @@ class Interpreter:
     # Forking
     # ------------------------------------------------------------------
 
-    def copy(self) -> Interpreter:
+    def copy(self) -> "Interpreter":
         """Return a forked interpreter sharing module caches.
 
         Caches (``module_cache``, ``module_ir_cache``, ``search_path``)
@@ -655,18 +743,20 @@ class Interpreter:
 
 
 # ---------------------------------------------------------------------------
-# Frame — per-invocation execution state
+# BaseFrame — abstract interpreter frame with pluggable instruction handlers
 # ---------------------------------------------------------------------------
 
 
-class Frame:
-    """Runtime state for one executing region.
+class BaseFrame:
+    """Abstract base for interpreter frames.
 
-    ``copy()`` returns a shallow copy with deep-copied mutable state.
-    ``search_path`` and module caches live on the shared ``interpreter``.
+    Subclasses implement individual ``dispatch_*`` methods to provide
+    semantics for specific instructions.  Unimplemented methods raise
+    ``NotImplementedError`` so that users discover missing handlers at
+    runtime.
 
-    All runtime services and instruction handlers are methods on this
-    class so that subclasses can override individual semantics.
+    ``copy()`` returns a shallow copy with deep-copied mutable state and
+    uses ``type(self)`` so that subclasses preserve their own type.
     """
 
     def __init__(
@@ -674,8 +764,8 @@ class Frame:
         interpreter: Interpreter,
         function: Function,
         function_ir: Region,
-        globals: Any,
-        locals: Any,
+        globals: Namespace,
+        locals: Namespace,
         cells: Dict[str, Cell],
         temps: Optional[Dict[TemporaryValue, Any]] = None,
         block_label: Optional[BasicBlockLabel] = None,
@@ -683,9 +773,9 @@ class Frame:
         finished: bool = False,
         return_value: Any = None,
         current_exception: Optional[BaseException] = None,
-        exc_stack: Optional[list] = None,
+        exc_stack: Optional[List[BaseException]] = None,
         pending_send_value: Any = _UNSET,
-        try_stack: Optional[list] = None,
+        try_stack: Optional[List[TryStackEntry]] = None,
         pending_return_value: Any = _UNSET,
         pending_jump_label: Any = _UNSET,
     ) -> None:
@@ -711,18 +801,20 @@ class Frame:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def copy(self) -> Frame:
+    def copy(self: FrameT) -> FrameT:
         """Return a copy of this frame safe for independent execution.
 
         ``interpreter``, ``globals``, ``function`` / ``function_ir``
         are shared; everything else is deep-copied.
+
+        Uses ``type(self)`` so that subclasses preserve their own type.
         """
-        return Frame(
+        return type(self)(
             interpreter=self.interpreter,
             function=self.function,
             function_ir=self.function_ir,
             globals=self.globals,
-            locals=dict(self.locals),
+            locals=dict(self.locals.items()),
             cells={k: Cell(value=v.value) for k, v in self.cells.items()},
             temps=dict(self.temps),
             block_label=self.block_label,
@@ -762,7 +854,7 @@ class Frame:
                 return basic_blocks[index + 1].label
         return None
 
-    def get_current_instruction(self) -> Optional[Any]:
+    def get_current_instruction(self) -> Optional[Instruction]:
         block = self.get_block()
         if self.instr_index < len(block.instructions):
             return block.instructions[self.instr_index]
@@ -772,7 +864,7 @@ class Frame:
     # Value helpers
     # ------------------------------------------------------------------
 
-    def _resolve_value(self, value: Any) -> Any:
+    def resolve_value(self, value: Any) -> Any:
         if isinstance(value, TemporaryValue):
             return self.temps[value]
         if isinstance(value, BasicBlockLabel):
@@ -785,7 +877,7 @@ class Frame:
     # Name resolution
     # ------------------------------------------------------------------
 
-    def _load_var(self, scope: Scope, name: str) -> Any:
+    def load_var(self, scope: Scope, name: str) -> Any:
         if scope == Scope.LOCAL:
             if name in self.locals:
                 return self.locals[name]
@@ -801,18 +893,18 @@ class Frame:
         if scope == Scope.GLOBAL:
             if name in self.globals:
                 return self.globals[name]
-            return self._load_builtin(name)
+            return self.load_builtin(name)
 
         if scope == Scope.NAME:
             if name in self.locals:
                 return self.locals[name]
             if name in self.globals:
                 return self.globals[name]
-            return self._load_builtin(name)
+            return self.load_builtin(name)
 
         raise NotImplementedError("unknown scope %r" % (scope,))
 
-    def _store_var(self, scope: Scope, name: str, value: Any) -> None:
+    def store_var(self, scope: Scope, name: str, value: Any) -> None:
         if scope == Scope.GLOBAL:
             self.globals[name] = value
             return
@@ -822,7 +914,7 @@ class Frame:
             return
         self.locals[name] = value
 
-    def _delete_var(self, scope: Scope, name: str) -> None:
+    def delete_var(self, scope: Scope, name: str) -> None:
         if scope == Scope.GLOBAL:
             del self.globals[name]
             return
@@ -833,7 +925,7 @@ class Frame:
             raise NameError(name)
         del self.locals[name]
 
-    def _load_builtin(self, name: str) -> Any:
+    def load_builtin(self, name: str) -> Any:
         builtins_obj = self.globals.get("__builtins__", builtins.__dict__)
         if isinstance(builtins_obj, dict):
             if name in builtins_obj:
@@ -847,7 +939,9 @@ class Frame:
     # Calls
     # ------------------------------------------------------------------
 
-    def _call_callee(self, callee: Any, args: List[Any], kwargs: Dict[str, Any]) -> Any:
+    def call_callee(
+        self, callee: Any, args: List[Any], kwargs: Dict[str, Any]
+    ) -> Any:
         if callee is builtins.super and not args and not kwargs:
             class_cell = self.cells.get("__class__")
             if class_cell is None:
@@ -884,7 +978,7 @@ class Frame:
     # Exception handling
     # ------------------------------------------------------------------
 
-    def _handle_exception(self, exception: BaseException) -> Optional[JumpEvent]:
+    def handle_exception(self, exception: BaseException) -> Optional[JumpEvent]:
         self.current_exception = exception
         for index in range(len(self.try_stack) - 1, -1, -1):
             entry = self.try_stack[index]
@@ -895,7 +989,7 @@ class Frame:
             return JumpEvent(target)
         return None
 
-    def _handle_return(self, value: Any) -> ReturnEvent:
+    def handle_return(self, value: Any) -> ControlEvent:
         for index in range(len(self.try_stack) - 1, -1, -1):
             entry = self.try_stack[index]
             target = entry.get("finally_label")
@@ -908,7 +1002,7 @@ class Frame:
         self.pending_jump_label = _UNSET
         return ReturnEvent(value)
 
-    def _handle_escape(self, target_label: BasicBlockLabel) -> JumpEvent:
+    def handle_escape(self, target_label: BasicBlockLabel) -> JumpEvent:
         for index in range(len(self.try_stack) - 1, -1, -1):
             entry = self.try_stack[index]
             finally_label = entry.get("finally_label")
@@ -921,30 +1015,28 @@ class Frame:
         self.pending_return_value = _UNSET
         return JumpEvent(target_label)
 
-    def _end_finally(self) -> Optional[Union[JumpEvent, ReturnEvent]]:
+    def end_finally(self) -> Optional[ControlEvent]:
         if self.current_exception is not None:
             exc = self.current_exception
-            handled = self._handle_exception(exc)
+            handled = self.handle_exception(exc)
             if handled is not None:
                 return handled
             raise exc
         if self.pending_return_value is not _UNSET:
             value = self.pending_return_value
             self.pending_return_value = _UNSET
-            return self._handle_return(value)
+            return self.handle_return(value)
         if self.pending_jump_label is not _UNSET:
             label = self.pending_jump_label
             self.pending_jump_label = _UNSET
-            return self._handle_escape(label)
+            return self.handle_escape(label)
         return None
 
     # ------------------------------------------------------------------
     # Execution loop
     # ------------------------------------------------------------------
 
-    def resume(
-        self, send_value: Optional[Any] = None
-    ) -> Union[YieldEvent, ReturnEvent]:
+    def resume(self, send_value: Any = None) -> StepEvent:
         if self.finished:
             return ReturnEvent(None)
         if self.block_label is None:
@@ -968,8 +1060,8 @@ class Frame:
     # Generator / coroutine wrappers
     # ------------------------------------------------------------------
 
-    def _make_generator_object(self) -> Any:
-        def generator() -> Any:
+    def make_generator_object(self) -> Generator[Any, Any, Any]:
+        def generator() -> Generator[Any, Any, Any]:
             send_value = None
             while True:
                 event = self.resume(send_value=send_value)
@@ -988,14 +1080,14 @@ class Frame:
 
         return generator()
 
-    def _make_coroutine_object(self) -> Any:
+    def make_coroutine_object(self) -> Coroutine[Any, Any, Any]:
         async def coroutine() -> Any:
             return self.run_to_completion()
 
         return coroutine()
 
-    def _make_async_generator_object(self) -> Any:
-        async def async_generator() -> Any:
+    def make_async_generator_object(self) -> AsyncGenerator[Any, Any]:
+        async def async_generator() -> AsyncGenerator[Any, Any]:
             send_value = None
             while True:
                 event = self.resume(send_value=send_value)
@@ -1011,6 +1103,368 @@ class Frame:
         return async_generator()
 
     # ===================================================================
+    # Instruction handler stubs  (self, instr) -> event | None
+    #
+    # Each raises NotImplementedError.  Subclasses must provide concrete
+    # implementations for the instructions they wish to support.
+    # ===================================================================
+
+    # --- value / variable ---
+
+    def dispatch_const(self, instr: Const) -> None:
+        raise NotImplementedError
+
+    def dispatch_load_name(self, instr: LoadName) -> None:
+        raise NotImplementedError
+
+    def dispatch_store_name(self, instr: StoreName) -> None:
+        raise NotImplementedError
+
+    def dispatch_delete_name(self, instr: DeleteName) -> None:
+        raise NotImplementedError
+
+    # --- computation ---
+
+    def dispatch_unary_op(self, instr: UnaryOp) -> None:
+        raise NotImplementedError
+
+    def dispatch_binary_op(self, instr: BinaryOp) -> None:
+        raise NotImplementedError
+
+    def dispatch_compare_op(self, instr: CompareOp) -> None:
+        raise NotImplementedError
+
+    # --- attribute / item access ---
+
+    def dispatch_load_attr(self, instr: LoadAttr) -> None:
+        raise NotImplementedError
+
+    def dispatch_store_attr(self, instr: StoreAttr) -> None:
+        raise NotImplementedError
+
+    def dispatch_delete_attr(self, instr: DeleteAttr) -> None:
+        raise NotImplementedError
+
+    def dispatch_load_item(self, instr: LoadItem) -> None:
+        raise NotImplementedError
+
+    def dispatch_store_item(self, instr: StoreItem) -> None:
+        raise NotImplementedError
+
+    def dispatch_delete_item(self, instr: DeleteItem) -> None:
+        raise NotImplementedError
+
+    # --- aggregates ---
+
+    def dispatch_build_tuple(self, instr: BuildTuple) -> None:
+        raise NotImplementedError
+
+    def dispatch_build_list(self, instr: BuildList) -> None:
+        raise NotImplementedError
+
+    def dispatch_build_set(self, instr: BuildSet) -> None:
+        raise NotImplementedError
+
+    def dispatch_build_map(self, instr: BuildMap) -> None:
+        raise NotImplementedError
+
+    def dispatch_build_slice(self, instr: BuildSlice) -> None:
+        raise NotImplementedError
+
+    def dispatch_build_string(self, instr: BuildString) -> None:
+        raise NotImplementedError
+
+    def dispatch_format_value(self, instr: FormatValue) -> None:
+        raise NotImplementedError
+
+    def dispatch_unpack(self, instr: Unpack) -> None:
+        raise NotImplementedError
+
+    # --- calls / imports / functions / classes ---
+
+    def dispatch_call(self, instr: Call) -> None:
+        raise NotImplementedError
+
+    def dispatch_import_name(self, instr: ImportName) -> None:
+        raise NotImplementedError
+
+    def dispatch_import_from(self, instr: ImportFrom) -> None:
+        raise NotImplementedError
+
+    def dispatch_import_star(self, instr: ImportStar) -> None:
+        raise NotImplementedError
+
+    def dispatch_make_function(self, instr: MakeFunction) -> None:
+        raise NotImplementedError
+
+    def dispatch_build_class(self, instr: BuildClass) -> None:
+        raise NotImplementedError
+
+    # --- iteration / async ---
+
+    def dispatch_get_iter(self, instr: GetIter) -> None:
+        raise NotImplementedError
+
+    def dispatch_for_iter(self, instr: ForIter) -> JumpEvent:
+        raise NotImplementedError
+
+    def dispatch_get_aiter(self, instr: GetAIter) -> None:
+        raise NotImplementedError
+
+    def dispatch_get_anext(self, instr: GetANext) -> None:
+        raise NotImplementedError
+
+    def dispatch_get_awaitable(self, instr: GetAwaitable) -> None:
+        raise NotImplementedError
+
+    def dispatch_yield_value(self, instr: YieldValue) -> YieldEvent:
+        raise NotImplementedError
+
+    def dispatch_yield_from(self, instr: YieldFrom) -> YieldEvent:
+        raise NotImplementedError
+
+    def dispatch_await_value(self, instr: AwaitValue) -> None:
+        raise NotImplementedError
+
+    # --- exceptions ---
+
+    def dispatch_current_exception(self, instr: CurrentException) -> None:
+        raise NotImplementedError
+
+    def dispatch_raise(self, instr: Raise) -> None:
+        raise NotImplementedError
+
+    def dispatch_reraise(self, instr: Reraise) -> None:
+        raise NotImplementedError
+
+    def dispatch_check_exc_match(self, instr: CheckExcMatch) -> None:
+        raise NotImplementedError
+
+    def dispatch_check_eg_match(self, instr: CheckEGMatch) -> None:
+        raise NotImplementedError
+
+    def dispatch_push_try(self, instr: PushTry) -> None:
+        raise NotImplementedError
+
+    def dispatch_pop_try(self, instr: PopTry) -> None:
+        raise NotImplementedError
+
+    def dispatch_clear_exception(self, instr: ClearException) -> None:
+        raise NotImplementedError
+
+    # --- control flow ---
+
+    def dispatch_end_finally(self, instr: EndFinally) -> Optional[ControlEvent]:
+        raise NotImplementedError
+
+    def dispatch_escape(self, instr: Escape) -> JumpEvent:
+        raise NotImplementedError
+
+    def dispatch_jump(self, instr: Jump) -> JumpEvent:
+        raise NotImplementedError
+
+    def dispatch_branch(self, instr: Branch) -> JumpEvent:
+        raise NotImplementedError
+
+    def dispatch_return(self, instr: Return) -> ControlEvent:
+        raise NotImplementedError
+
+    # --- pattern matching ---
+
+    def dispatch_match_mapping(self, instr: MatchMapping) -> None:
+        raise NotImplementedError
+
+    def dispatch_match_sequence(self, instr: MatchSequence) -> None:
+        raise NotImplementedError
+
+    def dispatch_match_keys(self, instr: MatchKeys) -> None:
+        raise NotImplementedError
+
+    def dispatch_match_class(self, instr: MatchClass) -> None:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Instruction dispatch
+    # ------------------------------------------------------------------
+
+    def dispatch_current_instruction(self) -> Optional[StepEvent]:
+        """Dispatch the current instruction and return its event.
+
+        Handles block fallthrough, PC advancement, jump application,
+        and exception dispatch internally:
+        - Effect instructions: PC advanced, returns ``None``.
+        - Jumps: applied (PC updated), returns ``None``.
+        - Exceptions: dispatched through try_stack, jumps applied.
+        - Yield / Return: returned to caller for ``resume`` to stop.
+        """
+        with self.interpreter.use_frame_class(type(self)):
+            if self.finished:
+                return ReturnEvent(None)
+            if self.block_label is None:
+                self.block_label = self.function_ir.entry_label
+
+            block = self.get_block()
+            if self.instr_index >= len(block.instructions):
+                next_label = self.fallthrough_label()
+                if next_label is None:
+                    self.finished = True
+                    return ReturnEvent(None)
+                self.block_label = next_label
+                self.instr_index = 0
+                block = self.get_block()
+
+            instr = block.instructions[self.instr_index]
+
+            # --- dispatch the instruction, catching exceptions ---
+            try:
+                event: Optional[DispatchEvent] = None
+                if isinstance(instr, Const):
+                    event = self.dispatch_const(instr)
+                elif isinstance(instr, LoadName):
+                    event = self.dispatch_load_name(instr)
+                elif isinstance(instr, StoreName):
+                    event = self.dispatch_store_name(instr)
+                elif isinstance(instr, DeleteName):
+                    event = self.dispatch_delete_name(instr)
+                elif isinstance(instr, UnaryOp):
+                    event = self.dispatch_unary_op(instr)
+                elif isinstance(instr, BinaryOp):
+                    event = self.dispatch_binary_op(instr)
+                elif isinstance(instr, CompareOp):
+                    event = self.dispatch_compare_op(instr)
+                elif isinstance(instr, LoadAttr):
+                    event = self.dispatch_load_attr(instr)
+                elif isinstance(instr, StoreAttr):
+                    event = self.dispatch_store_attr(instr)
+                elif isinstance(instr, DeleteAttr):
+                    event = self.dispatch_delete_attr(instr)
+                elif isinstance(instr, LoadItem):
+                    event = self.dispatch_load_item(instr)
+                elif isinstance(instr, StoreItem):
+                    event = self.dispatch_store_item(instr)
+                elif isinstance(instr, DeleteItem):
+                    event = self.dispatch_delete_item(instr)
+                elif isinstance(instr, BuildTuple):
+                    event = self.dispatch_build_tuple(instr)
+                elif isinstance(instr, BuildList):
+                    event = self.dispatch_build_list(instr)
+                elif isinstance(instr, BuildSet):
+                    event = self.dispatch_build_set(instr)
+                elif isinstance(instr, BuildMap):
+                    event = self.dispatch_build_map(instr)
+                elif isinstance(instr, BuildSlice):
+                    event = self.dispatch_build_slice(instr)
+                elif isinstance(instr, BuildString):
+                    event = self.dispatch_build_string(instr)
+                elif isinstance(instr, FormatValue):
+                    event = self.dispatch_format_value(instr)
+                elif isinstance(instr, Unpack):
+                    event = self.dispatch_unpack(instr)
+                elif isinstance(instr, Call):
+                    event = self.dispatch_call(instr)
+                elif isinstance(instr, ImportName):
+                    event = self.dispatch_import_name(instr)
+                elif isinstance(instr, ImportFrom):
+                    event = self.dispatch_import_from(instr)
+                elif isinstance(instr, ImportStar):
+                    event = self.dispatch_import_star(instr)
+                elif isinstance(instr, MakeFunction):
+                    event = self.dispatch_make_function(instr)
+                elif isinstance(instr, BuildClass):
+                    event = self.dispatch_build_class(instr)
+                elif isinstance(instr, GetIter):
+                    event = self.dispatch_get_iter(instr)
+                elif isinstance(instr, ForIter):
+                    event = self.dispatch_for_iter(instr)
+                elif isinstance(instr, GetAIter):
+                    event = self.dispatch_get_aiter(instr)
+                elif isinstance(instr, GetANext):
+                    event = self.dispatch_get_anext(instr)
+                elif isinstance(instr, GetAwaitable):
+                    event = self.dispatch_get_awaitable(instr)
+                elif isinstance(instr, YieldValue):
+                    event = self.dispatch_yield_value(instr)
+                elif isinstance(instr, YieldFrom):
+                    event = self.dispatch_yield_from(instr)
+                elif isinstance(instr, AwaitValue):
+                    event = self.dispatch_await_value(instr)
+                elif isinstance(instr, CurrentException):
+                    event = self.dispatch_current_exception(instr)
+                elif isinstance(instr, Raise):
+                    event = self.dispatch_raise(instr)
+                elif isinstance(instr, Reraise):
+                    event = self.dispatch_reraise(instr)
+                elif isinstance(instr, CheckExcMatch):
+                    event = self.dispatch_check_exc_match(instr)
+                elif isinstance(instr, CheckEGMatch):
+                    event = self.dispatch_check_eg_match(instr)
+                elif isinstance(instr, PushTry):
+                    event = self.dispatch_push_try(instr)
+                elif isinstance(instr, PopTry):
+                    event = self.dispatch_pop_try(instr)
+                elif isinstance(instr, ClearException):
+                    event = self.dispatch_clear_exception(instr)
+                elif isinstance(instr, EndFinally):
+                    event = self.dispatch_end_finally(instr)
+                elif isinstance(instr, Escape):
+                    event = self.dispatch_escape(instr)
+                elif isinstance(instr, Jump):
+                    event = self.dispatch_jump(instr)
+                elif isinstance(instr, Branch):
+                    event = self.dispatch_branch(instr)
+                elif isinstance(instr, Return):
+                    event = self.dispatch_return(instr)
+                elif isinstance(instr, MatchMapping):
+                    event = self.dispatch_match_mapping(instr)
+                elif isinstance(instr, MatchSequence):
+                    event = self.dispatch_match_sequence(instr)
+                elif isinstance(instr, MatchKeys):
+                    event = self.dispatch_match_keys(instr)
+                elif isinstance(instr, MatchClass):
+                    event = self.dispatch_match_class(instr)
+                else:
+                    raise NotImplementedError(
+                        "unsupported IR instruction: %r" % (instr,)
+                    )
+            except BaseException as exc:
+                handled = self.handle_exception(exc)
+                if handled is None:
+                    self.current_exception = exc
+                    raise
+                event = handled
+
+            # --- apply the event ---
+            if event is None:
+                self.instr_index += 1
+                return None
+            if isinstance(event, JumpEvent):
+                self.block_label = event.target
+                self.instr_index = 0
+                return None
+            elif isinstance(event, YieldEvent):
+                self.instr_index += 1
+                return event
+            elif isinstance(event, ReturnEvent):
+                self.finished = True
+                return event
+            else:
+                raise RuntimeError("unknown execution event %r" % (event,))
+
+
+# ---------------------------------------------------------------------------
+# Frame — full concrete interpreter frame
+# ---------------------------------------------------------------------------
+
+
+class Frame(BaseFrame):
+    """Full implementation of all 52 interpreter instruction handlers.
+
+    Extends ``BaseFrame`` with concrete ``dispatch_*`` methods.
+    Subclass ``BaseFrame`` directly when you want to build a custom
+    interpreter with incremental handler implementations.
+    """
+
+    # ===================================================================
     # Instruction handler methods  (self, instr) -> event | None
     # ===================================================================
 
@@ -1021,71 +1475,71 @@ class Frame:
         return None
 
     def dispatch_load_name(self, instr: LoadName) -> None:
-        self.temps[instr.dst] = self._load_var(instr.scope, instr.name)
+        self.temps[instr.dst] = self.load_var(instr.scope, instr.name)
         return None
 
     def dispatch_store_name(self, instr: StoreName) -> None:
-        self._store_var(instr.scope, instr.name, self._resolve_value(instr.src))
+        self.store_var(instr.scope, instr.name, self.resolve_value(instr.src))
         return None
 
     def dispatch_delete_name(self, instr: DeleteName) -> None:
-        self._delete_var(instr.scope, instr.name)
+        self.delete_var(instr.scope, instr.name)
         return None
 
     # --- computation ---
 
     def dispatch_unary_op(self, instr: UnaryOp) -> None:
         self.temps[instr.dst] = apply_unary(
-            instr.op, self._resolve_value(instr.src)
+            instr.op, self.resolve_value(instr.src)
         )
         return None
 
     def dispatch_binary_op(self, instr: BinaryOp) -> None:
-        lhs = self._resolve_value(instr.lhs)
-        rhs = self._resolve_value(instr.rhs)
+        lhs = self.resolve_value(instr.lhs)
+        rhs = self.resolve_value(instr.rhs)
         self.temps[instr.dst] = apply_binary(instr.op, lhs, rhs)
         return None
 
     def dispatch_compare_op(self, instr: CompareOp) -> None:
-        lhs = self._resolve_value(instr.lhs)
-        rhs = self._resolve_value(instr.rhs)
+        lhs = self.resolve_value(instr.lhs)
+        rhs = self.resolve_value(instr.rhs)
         self.temps[instr.dst] = apply_compare(instr.cmp, lhs, rhs)
         return None
 
     # --- attribute / item access ---
 
     def dispatch_load_attr(self, instr: LoadAttr) -> None:
-        obj = self._resolve_value(instr.obj)
+        obj = self.resolve_value(instr.obj)
         self.temps[instr.dst] = getattr(obj, instr.attr_name)
         return None
 
     def dispatch_store_attr(self, instr: StoreAttr) -> None:
         setattr(
-            self._resolve_value(instr.obj),
+            self.resolve_value(instr.obj),
             instr.attr_name,
-            self._resolve_value(instr.value),
+            self.resolve_value(instr.value),
         )
         return None
 
     def dispatch_delete_attr(self, instr: DeleteAttr) -> None:
-        delattr(self._resolve_value(instr.obj), instr.attr_name)
+        delattr(self.resolve_value(instr.obj), instr.attr_name)
         return None
 
     def dispatch_load_item(self, instr: LoadItem) -> None:
-        obj = self._resolve_value(instr.obj)
-        key = self._resolve_value(instr.key)
+        obj = self.resolve_value(instr.obj)
+        key = self.resolve_value(instr.key)
         self.temps[instr.dst] = obj[key]
         return None
 
     def dispatch_store_item(self, instr: StoreItem) -> None:
-        obj = self._resolve_value(instr.obj)
-        key = self._resolve_value(instr.key)
-        value = self._resolve_value(instr.value)
+        obj = self.resolve_value(instr.obj)
+        key = self.resolve_value(instr.key)
+        value = self.resolve_value(instr.value)
         obj[key] = value
         return None
 
     def dispatch_delete_item(self, instr: DeleteItem) -> None:
-        del self._resolve_value(instr.obj)[self._resolve_value(instr.key)]
+        del self.resolve_value(instr.obj)[self.resolve_value(instr.key)]
         return None
 
     # --- aggregates ---
@@ -1094,9 +1548,9 @@ class Frame:
         built = []
         for item in instr.items:
             if isinstance(item, UnpackedTemporaryValue):
-                built.extend(self._resolve_value(item.value))
+                built.extend(self.resolve_value(item.value))
             else:
-                built.append(self._resolve_value(item))
+                built.append(self.resolve_value(item))
         self.temps[instr.dst] = tuple(built)
         return None
 
@@ -1104,9 +1558,9 @@ class Frame:
         built = []
         for item in instr.items:
             if isinstance(item, UnpackedTemporaryValue):
-                built.extend(self._resolve_value(item.value))
+                built.extend(self.resolve_value(item.value))
             else:
-                built.append(self._resolve_value(item))
+                built.append(self.resolve_value(item))
         self.temps[instr.dst] = built
         return None
 
@@ -1114,9 +1568,9 @@ class Frame:
         built = set()
         for item in instr.items:
             if isinstance(item, UnpackedTemporaryValue):
-                built.update(self._resolve_value(item.value))
+                built.update(self.resolve_value(item.value))
             else:
-                built.add(self._resolve_value(item))
+                built.add(self.resolve_value(item))
         self.temps[instr.dst] = built
         return None
 
@@ -1124,28 +1578,28 @@ class Frame:
         built = {}
         for key, value in instr.items:
             if key is None:
-                built.update(dict(self._resolve_value(value)))
+                built.update(dict(self.resolve_value(value)))
             else:
-                built[self._resolve_value(key)] = self._resolve_value(value)
+                built[self.resolve_value(key)] = self.resolve_value(value)
         self.temps[instr.dst] = built
         return None
 
     def dispatch_build_slice(self, instr: BuildSlice) -> None:
         self.temps[instr.dst] = slice(
-            self._resolve_value(instr.start),
-            self._resolve_value(instr.stop),
-            None if instr.step is None else self._resolve_value(instr.step),
+            self.resolve_value(instr.start),
+            self.resolve_value(instr.stop),
+            None if instr.step is None else self.resolve_value(instr.step),
         )
         return None
 
     def dispatch_build_string(self, instr: BuildString) -> None:
         self.temps[instr.dst] = "".join(
-            str(self._resolve_value(part)) for part in instr.parts
+            str(self.resolve_value(part)) for part in instr.parts
         )
         return None
 
     def dispatch_format_value(self, instr: FormatValue) -> None:
-        value = self._resolve_value(instr.value)
+        value = self.resolve_value(instr.value)
         if instr.conversion == "repr":
             value = repr(value)
         elif instr.conversion == "ascii":
@@ -1153,12 +1607,12 @@ class Frame:
         else:
             value = str(value)
         if instr.spec is not None:
-            value = format(value, self._resolve_value(instr.spec))
+            value = format(value, self.resolve_value(instr.spec))
         self.temps[instr.dst] = value
         return None
 
     def dispatch_unpack(self, instr: Unpack) -> None:
-        values = list(self._resolve_value(instr.src))
+        values = list(self.resolve_value(instr.src))
         if instr.star_index is None:
             if len(values) != len(instr.dsts):
                 raise ValueError("unpack mismatch")
@@ -1185,16 +1639,16 @@ class Frame:
     # --- calls / imports / functions / classes ---
 
     def dispatch_call(self, instr: Call) -> None:
-        callee = self._resolve_value(instr.callee)
+        callee = self.resolve_value(instr.callee)
         args = []
         for arg in instr.args:
             if isinstance(arg, UnpackedTemporaryValue):
-                args.extend(self._resolve_value(arg.value))
+                args.extend(self.resolve_value(arg.value))
             else:
-                args.append(self._resolve_value(arg))
+                args.append(self.resolve_value(arg))
         kwargs = {}
         for name, value in instr.kwargs:
-            resolved = self._resolve_value(value)
+            resolved = self.resolve_value(value)
             if name is None:
                 for key, item in dict(resolved).items():
                     if key in kwargs:
@@ -1208,7 +1662,7 @@ class Frame:
                         "multiple values for keyword argument %r" % (name,)
                     )
                 kwargs[name] = resolved
-        self.temps[instr.dst] = self._call_callee(callee, args, kwargs)
+        self.temps[instr.dst] = self.call_callee(callee, args, kwargs)
         return None
 
     def dispatch_import_name(self, instr: ImportName) -> None:
@@ -1218,12 +1672,12 @@ class Frame:
         return None
 
     def dispatch_import_from(self, instr: ImportFrom) -> None:
-        module_obj = self._resolve_value(instr.module_obj)
+        module_obj = self.resolve_value(instr.module_obj)
         self.temps[instr.dst] = getattr(module_obj, instr.name)
         return None
 
     def dispatch_import_star(self, instr: ImportStar) -> None:
-        module_obj = self._resolve_value(instr.module_obj)
+        module_obj = self.resolve_value(instr.module_obj)
         export_names = getattr(module_obj, "__all__", None)
         if export_names is None:
             export_names = [
@@ -1234,7 +1688,7 @@ class Frame:
         return None
 
     def dispatch_make_function(self, instr: MakeFunction) -> None:
-        region = self.function._get_child_region(instr.code)
+        region = self.function.get_child_region(instr.code)
         closure = {}
         for name in region.freevars:
             if name in self.cells:
@@ -1253,13 +1707,13 @@ class Frame:
             closure_cells=closure,
             qualname=qualname,
             __defaults__=(
-                tuple(self._resolve_value(value) for value in instr.defaults)
+                tuple(self.resolve_value(value) for value in instr.defaults)
                 if instr.defaults
                 else None
             ),
             __kwdefaults__=(
                 {
-                    name: self._resolve_value(value)
+                    name: self.resolve_value(value)
                     for name, value in instr.kwdefaults
                 }
                 if instr.kwdefaults
@@ -1267,7 +1721,7 @@ class Frame:
             ),
             __annotations__=(
                 {
-                    name: self._resolve_value(value)
+                    name: self.resolve_value(value)
                     for name, value in instr.annotations
                 }
                 if instr.annotations
@@ -1278,10 +1732,10 @@ class Frame:
         return None
 
     def dispatch_build_class(self, instr: BuildClass) -> None:
-        body = self._resolve_value(instr.body_func)
-        name = self._resolve_value(instr.name)
-        bases = [self._resolve_value(base) for base in instr.bases]
-        keywords = {n: self._resolve_value(v) for n, v in instr.keywords}
+        body = self.resolve_value(instr.body_func)
+        name = self.resolve_value(instr.name)
+        bases = [self.resolve_value(base) for base in instr.bases]
+        keywords = {n: self.resolve_value(v) for n, v in instr.keywords}
         self.temps[instr.dst] = self.interpreter.build_class(
             body, name, *bases, **keywords
         )
@@ -1290,11 +1744,11 @@ class Frame:
     # --- iteration / async ---
 
     def dispatch_get_iter(self, instr: GetIter) -> None:
-        self.temps[instr.dst] = iter(self._resolve_value(instr.iterable))
+        self.temps[instr.dst] = iter(self.resolve_value(instr.iterable))
         return None
 
     def dispatch_for_iter(self, instr: ForIter) -> JumpEvent:
-        iterator = self._resolve_value(instr.iter_obj)
+        iterator = self.resolve_value(instr.iter_obj)
         try:
             value = next(iterator)
         except StopIteration:
@@ -1303,20 +1757,20 @@ class Frame:
         return JumpEvent(instr.body_label)
 
     def dispatch_get_aiter(self, instr: GetAIter) -> None:
-        self.temps[instr.dst] = self._resolve_value(instr.iterable).__aiter__()
+        self.temps[instr.dst] = self.resolve_value(instr.iterable).__aiter__()
         return None
 
     def dispatch_get_anext(self, instr: GetANext) -> None:
-        self.temps[instr.dst] = self._resolve_value(instr.aiter).__anext__()
+        self.temps[instr.dst] = self.resolve_value(instr.aiter).__anext__()
         return None
 
     def dispatch_get_awaitable(self, instr: GetAwaitable) -> None:
-        value = self._resolve_value(instr.value)
+        value = self.resolve_value(instr.value)
         self.temps[instr.dst] = value if inspect.isawaitable(value) else value
         return None
 
     def dispatch_yield_value(self, instr: YieldValue) -> YieldEvent:
-        yielded = self._resolve_value(instr.value)
+        yielded = self.resolve_value(instr.value)
         sent_value = (
             None if self.pending_send_value is _UNSET else self.pending_send_value
         )
@@ -1325,12 +1779,12 @@ class Frame:
         return YieldEvent(yielded)
 
     def dispatch_yield_from(self, instr: YieldFrom) -> YieldEvent:
-        yielded = self._resolve_value(instr.value)
+        yielded = self.resolve_value(instr.value)
         self.temps[instr.dst] = None
         return YieldEvent(yielded)
 
     def dispatch_await_value(self, instr: AwaitValue) -> None:
-        self.temps[instr.dst] = await_sync(self._resolve_value(instr.value))
+        self.temps[instr.dst] = await_sync(self.resolve_value(instr.value))
         return None
 
     # --- exceptions ---
@@ -1340,10 +1794,10 @@ class Frame:
         return None
 
     def dispatch_raise(self, instr: Raise) -> None:
-        exc = normalize_exception_for_raise(self._resolve_value(instr.exc))
+        exc = normalize_exception_for_raise(self.resolve_value(instr.exc))
         if instr.cause is not None:
             cause = normalize_exception_for_raise(
-                self._resolve_value(instr.cause), allow_none=True
+                self.resolve_value(instr.cause), allow_none=True
             )
             exc.__cause__ = cause
             exc.__suppress_context__ = True
@@ -1355,8 +1809,8 @@ class Frame:
         raise self.current_exception
 
     def dispatch_check_exc_match(self, instr: CheckExcMatch) -> None:
-        exc = self._resolve_value(instr.exc)
-        typ = self._resolve_value(instr.typ)
+        exc = self.resolve_value(instr.exc)
+        typ = self.resolve_value(instr.typ)
         self.temps[instr.dst] = check_exception_match(exc, typ)
         return None
 
@@ -1386,42 +1840,42 @@ class Frame:
 
     def dispatch_end_finally(
         self, instr: EndFinally
-    ) -> Optional[Union[JumpEvent, ReturnEvent]]:
-        return self._end_finally()
+    ) -> Optional[ControlEvent]:
+        return self.end_finally()
 
     def dispatch_escape(self, instr: Escape) -> JumpEvent:
-        return self._handle_escape(instr.target)
+        return self.handle_escape(instr.target)
 
     def dispatch_jump(self, instr: Jump) -> JumpEvent:
         return JumpEvent(instr.target)
 
     def dispatch_branch(self, instr: Branch) -> JumpEvent:
-        cond = self._resolve_value(instr.cond)
+        cond = self.resolve_value(instr.cond)
         return JumpEvent(instr.true_label if cond else instr.false_label)
 
-    def dispatch_return(self, instr: Return) -> ReturnEvent:
-        value = self._resolve_value(instr.value)
+    def dispatch_return(self, instr: Return) -> ControlEvent:
+        value = self.resolve_value(instr.value)
         self.current_exception = None
-        return self._handle_return(value)
+        return self.handle_return(value)
 
     # --- pattern matching ---
 
     def dispatch_match_mapping(self, instr: MatchMapping) -> None:
-        value = self._resolve_value(instr.value)
-        self.temps[instr.dst] = isinstance(value, Mapping)
+        value = self.resolve_value(instr.value)
+        self.temps[instr.dst] = isinstance(value, abc.Mapping)
         return None
 
     def dispatch_match_sequence(self, instr: MatchSequence) -> None:
-        value = self._resolve_value(instr.value)
+        value = self.resolve_value(instr.value)
         self.temps[instr.dst] = (
-            isinstance(value, Sequence)
+            isinstance(value, abc.Sequence)
             and not isinstance(value, (str, bytes, bytearray))
         )
         return None
 
     def dispatch_match_keys(self, instr: MatchKeys) -> None:
-        mapping = self._resolve_value(instr.mapping)
-        keys = self._resolve_value(instr.keys)
+        mapping = self.resolve_value(instr.mapping)
+        keys = self.resolve_value(instr.keys)
         try:
             result = tuple(mapping[key] for key in keys)
         except Exception:
@@ -1430,174 +1884,10 @@ class Frame:
         return None
 
     def dispatch_match_class(self, instr: MatchClass) -> None:
-        value = self._resolve_value(instr.value)
-        cls = self._resolve_value(instr.cls)
+        value = self.resolve_value(instr.value)
+        cls = self.resolve_value(instr.cls)
         self.temps[instr.dst] = isinstance(value, cls)
         return None
-
-    # ------------------------------------------------------------------
-    # Instruction dispatch
-    # ------------------------------------------------------------------
-
-    def dispatch_current_instruction(self) -> Optional[Any]:
-        """Dispatch the current instruction and return its event.
-
-        Handles block fallthrough, PC advancement, jump application,
-        and exception dispatch internally:
-        - Effect instructions: PC advanced, returns ``None``.
-        - Jumps: applied (PC updated), returns ``None``.
-        - Exceptions: dispatched through try_stack, jumps applied.
-        - Yield / Return: returned to caller for ``resume`` to stop.
-        """
-        if self.finished:
-            return ReturnEvent(None)
-        if self.block_label is None:
-            self.block_label = self.function_ir.entry_label
-
-        block = self.get_block()
-        if self.instr_index >= len(block.instructions):
-            next_label = self.fallthrough_label()
-            if next_label is None:
-                self.finished = True
-                return ReturnEvent(None)
-            self.block_label = next_label
-            self.instr_index = 0
-            block = self.get_block()
-
-        instr = block.instructions[self.instr_index]
-
-        # --- dispatch the instruction, catching exceptions ---
-        try:
-            event: Optional[Any] = None
-            if isinstance(instr, Const):
-                event = self.dispatch_const(instr)
-            elif isinstance(instr, LoadName):
-                event = self.dispatch_load_name(instr)
-            elif isinstance(instr, StoreName):
-                event = self.dispatch_store_name(instr)
-            elif isinstance(instr, DeleteName):
-                event = self.dispatch_delete_name(instr)
-            elif isinstance(instr, UnaryOp):
-                event = self.dispatch_unary_op(instr)
-            elif isinstance(instr, BinaryOp):
-                event = self.dispatch_binary_op(instr)
-            elif isinstance(instr, CompareOp):
-                event = self.dispatch_compare_op(instr)
-            elif isinstance(instr, LoadAttr):
-                event = self.dispatch_load_attr(instr)
-            elif isinstance(instr, StoreAttr):
-                event = self.dispatch_store_attr(instr)
-            elif isinstance(instr, DeleteAttr):
-                event = self.dispatch_delete_attr(instr)
-            elif isinstance(instr, LoadItem):
-                event = self.dispatch_load_item(instr)
-            elif isinstance(instr, StoreItem):
-                event = self.dispatch_store_item(instr)
-            elif isinstance(instr, DeleteItem):
-                event = self.dispatch_delete_item(instr)
-            elif isinstance(instr, BuildTuple):
-                event = self.dispatch_build_tuple(instr)
-            elif isinstance(instr, BuildList):
-                event = self.dispatch_build_list(instr)
-            elif isinstance(instr, BuildSet):
-                event = self.dispatch_build_set(instr)
-            elif isinstance(instr, BuildMap):
-                event = self.dispatch_build_map(instr)
-            elif isinstance(instr, BuildSlice):
-                event = self.dispatch_build_slice(instr)
-            elif isinstance(instr, BuildString):
-                event = self.dispatch_build_string(instr)
-            elif isinstance(instr, FormatValue):
-                event = self.dispatch_format_value(instr)
-            elif isinstance(instr, Unpack):
-                event = self.dispatch_unpack(instr)
-            elif isinstance(instr, Call):
-                event = self.dispatch_call(instr)
-            elif isinstance(instr, ImportName):
-                event = self.dispatch_import_name(instr)
-            elif isinstance(instr, ImportFrom):
-                event = self.dispatch_import_from(instr)
-            elif isinstance(instr, ImportStar):
-                event = self.dispatch_import_star(instr)
-            elif isinstance(instr, MakeFunction):
-                event = self.dispatch_make_function(instr)
-            elif isinstance(instr, BuildClass):
-                event = self.dispatch_build_class(instr)
-            elif isinstance(instr, GetIter):
-                event = self.dispatch_get_iter(instr)
-            elif isinstance(instr, ForIter):
-                event = self.dispatch_for_iter(instr)
-            elif isinstance(instr, GetAIter):
-                event = self.dispatch_get_aiter(instr)
-            elif isinstance(instr, GetANext):
-                event = self.dispatch_get_anext(instr)
-            elif isinstance(instr, GetAwaitable):
-                event = self.dispatch_get_awaitable(instr)
-            elif isinstance(instr, YieldValue):
-                event = self.dispatch_yield_value(instr)
-            elif isinstance(instr, YieldFrom):
-                event = self.dispatch_yield_from(instr)
-            elif isinstance(instr, AwaitValue):
-                event = self.dispatch_await_value(instr)
-            elif isinstance(instr, CurrentException):
-                event = self.dispatch_current_exception(instr)
-            elif isinstance(instr, Raise):
-                event = self.dispatch_raise(instr)
-            elif isinstance(instr, Reraise):
-                event = self.dispatch_reraise(instr)
-            elif isinstance(instr, CheckExcMatch):
-                event = self.dispatch_check_exc_match(instr)
-            elif isinstance(instr, CheckEGMatch):
-                event = self.dispatch_check_eg_match(instr)
-            elif isinstance(instr, PushTry):
-                event = self.dispatch_push_try(instr)
-            elif isinstance(instr, PopTry):
-                event = self.dispatch_pop_try(instr)
-            elif isinstance(instr, ClearException):
-                event = self.dispatch_clear_exception(instr)
-            elif isinstance(instr, EndFinally):
-                event = self.dispatch_end_finally(instr)
-            elif isinstance(instr, Escape):
-                event = self.dispatch_escape(instr)
-            elif isinstance(instr, Jump):
-                event = self.dispatch_jump(instr)
-            elif isinstance(instr, Branch):
-                event = self.dispatch_branch(instr)
-            elif isinstance(instr, Return):
-                event = self.dispatch_return(instr)
-            elif isinstance(instr, MatchMapping):
-                event = self.dispatch_match_mapping(instr)
-            elif isinstance(instr, MatchSequence):
-                event = self.dispatch_match_sequence(instr)
-            elif isinstance(instr, MatchKeys):
-                event = self.dispatch_match_keys(instr)
-            elif isinstance(instr, MatchClass):
-                event = self.dispatch_match_class(instr)
-            else:
-                raise NotImplementedError("unsupported IR instruction: %r" % (instr,))
-        except BaseException as exc:
-            handled = self._handle_exception(exc)
-            if handled is None:
-                self.current_exception = exc
-                raise
-            event = handled
-
-        # --- apply the event ---
-        if event is None:
-            self.instr_index += 1
-            return None
-        if isinstance(event, JumpEvent):
-            self.block_label = event.target
-            self.instr_index = 0
-            return None
-        elif isinstance(event, YieldEvent):
-            self.instr_index += 1
-            return event
-        elif isinstance(event, ReturnEvent):
-            self.finished = True
-            return event
-        else:
-            raise RuntimeError("unknown execution event %r" % (event,))
 
 
 # ---------------------------------------------------------------------------
