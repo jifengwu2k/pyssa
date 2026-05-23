@@ -23,7 +23,6 @@ from typing import (
     Sequence,
     Tuple,
     Type,
-    TypeVar,
     Union,
     ValuesView,
 )
@@ -124,9 +123,6 @@ class ReturnEvent:
     """Return a value from the current frame."""
 
     value: Any
-
-
-FrameT = TypeVar("FrameT", bound="BaseFrame")
 
 
 class Namespace(Protocol):
@@ -355,17 +351,13 @@ ModuleValue = Union[Module, types.ModuleType]
 
 
 class Function:
-    """A compiled pyssa IR function — pure data, no execution logic.
-
-    Use ``Interpreter.call(fn, args, kwargs)`` to invoke.
-    """
+    """A compiled pyssa IR function — pure data, no execution logic."""
 
     def __init__(
         self,
         region_ir: Region,
         globals_dict: Namespace,
         closure_cells: Optional[Dict[str, Cell]] = None,
-        qualname: Optional[str] = None,
         preloaded_locals: Optional[Dict[str, Any]] = None,
         __defaults__: Optional[Tuple[Any, ...]] = None,
         __kwdefaults__: Optional[Dict[str, Any]] = None,
@@ -374,24 +366,13 @@ class Function:
         self.region_ir = region_ir
         self.globals_dict = globals_dict
         self.closure_cells = dict(closure_cells or {})
-        self.qualname = qualname
         self.preloaded_locals = dict(preloaded_locals or {})
         self.__defaults__ = __defaults__
         self.__kwdefaults__ = __kwdefaults__
         self.__annotations__ = __annotations__ if __annotations__ is not None else {}
 
         self.__name__ = region_ir.name.split("#", 1)[0]
-        self.__qualname__ = qualname or self.__name__
         self.__module__ = globals_dict.get("__name__", "__main__")
-
-    def get_child_region(self, label: RegionLabel) -> Region:
-        """Look up a child region by its label."""
-        for child_region in self.region_ir.child_regions:
-            if child_region.label == label:
-                return child_region
-        raise KeyError(
-            "unknown child region label %r in %s" % (label, self.region_ir.name)
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -400,11 +381,7 @@ class Function:
 
 
 class Interpreter:
-    """Manages module loading and execution of ``Function`` objects.
-
-    Shared across ``Frame.copy()`` so that module caches are
-    consistent within a forked execution tree.
-    """
+    """Manages module loading and execution of ``Function`` objects."""
 
     def __init__(
         self,
@@ -523,7 +500,15 @@ class Interpreter:
             module.setdefault("__builtins__", builtins.__dict__)
             module["__build_class__"] = self.build_class
             module_ir = self.load_module_ir(origin)
-            self.run_module(module_ir, module)
+            module_function = Function(region_ir=module_ir, globals_dict=module)
+            module.setdefault("__name__", module_function.__name__)
+            frame = self.make_frame(module_function, (), {}, locals=module)
+            while not frame.finished:
+                event = frame.dispatch_current_instruction()
+                if event is not None:
+                    if isinstance(event, ReturnEvent):
+                        break
+                    raise RuntimeError("frame yielded unexpectedly: %r" % (event,))
         except BaseException:
             del self.module_cache[fullname]
             raise
@@ -617,72 +602,12 @@ class Interpreter:
         return frame_class(
             interpreter=self,
             function=function,
-            function_ir=region_ir,
             globals=function.globals_dict,
             locals=locals,
             cells=cells,
             block_label=region_ir.entry_label,
             instr_index=0,
         )
-
-    def call(
-        self,
-        function: Function,
-        args: Tuple[Any, ...],
-        kwargs: Dict[str, Any],
-        *,
-        locals: Optional[Namespace] = None,
-        frame_class: Optional[Type["BaseFrame"]] = None,
-    ) -> Any:
-        """Invoke *function* and return its result.
-
-        Generator / coroutine / async-generator dispatch is handled
-        here so that callers always get a Python-idiomatic result.
-        """
-        frame = self.make_frame(
-            function,
-            args,
-            kwargs,
-            locals=locals,
-            frame_class=frame_class,
-        )
-        flags = function.region_ir.flags
-        if flags & inspect.CO_ASYNC_GENERATOR:
-            return frame.make_async_generator_object()
-        if flags & inspect.CO_COROUTINE:
-            return frame.make_coroutine_object()
-        if flags & inspect.CO_GENERATOR:
-            return frame.make_generator_object()
-        return frame.run_to_completion()
-
-    def run_module(
-        self,
-        module_ir: Region,
-        globals: Namespace,
-        locals: Optional[Namespace] = None,
-        qualname: str = "<module>",
-        frame_class: Optional[Type["BaseFrame"]] = None,
-    ) -> Namespace:
-        """Execute a top-level module ``Region``."""
-        if locals is None:
-            locals = globals
-        module_function = Function(
-            region_ir=module_ir,
-            globals_dict=globals,
-            qualname=qualname,
-        )
-        locals.setdefault("__name__", qualname)
-        locals.setdefault("__builtins__", builtins.__dict__)
-        locals["__build_class__"] = self.build_class
-        frame = self.make_frame(
-            module_function,
-            (),
-            {},
-            locals=locals,
-            frame_class=frame_class,
-        )
-        frame.run_to_completion()
-        return locals
 
     def build_class(
         self,
@@ -712,7 +637,6 @@ class Interpreter:
             "__name__", "__main__"
         )
         namespace["__qualname__"] = name
-        body_function.__qualname__ = name
         frame = self.make_frame(body_function, (), {}, locals=namespace)
         frame.run_to_completion()
         for special_name in ("__init_subclass__", "__class_getitem__"):
@@ -725,16 +649,8 @@ class Interpreter:
             class_cell.value = cls
         return cls
 
-    # ------------------------------------------------------------------
-    # Forking
-    # ------------------------------------------------------------------
-
     def copy(self) -> "Interpreter":
-        """Return a forked interpreter sharing module caches.
-
-        Caches (``module_cache``, ``module_ir_cache``, ``search_path``)
-        are shared; the returned interpreter has no associated frame.
-        """
+        """Return a forked interpreter sharing module caches."""
         return Interpreter(
             search_path=self.search_path,
             module_ir_cache=self.module_ir_cache,
@@ -750,134 +666,62 @@ class Interpreter:
 class BaseFrame:
     """Abstract base for interpreter frames.
 
-    Subclasses implement individual ``dispatch_*`` methods to provide
-    semantics for specific instructions.  Unimplemented methods raise
-    ``NotImplementedError`` so that users discover missing handlers at
-    runtime.
+    Fields (set by ``__init__``):
+        interpreter     — the owning ``Interpreter`` instance
+        function        — the ``Function`` being executed
+        locals          — local variable namespace
+        globals         — global variable namespace
+        block_label     — current ``BasicBlockLabel``
+        instr_index     — instruction offset within the current block
+        cells           — closure cell dict (name → ``Cell``)
+        try_stack       — exception handler stack
+        finished        — whether execution has completed
+        return_value    — value returned after completion
+        current_exception — active exception (or ``None``)
 
-    ``copy()`` returns a shallow copy with deep-copied mutable state and
-    uses ``type(self)`` so that subclasses preserve their own type.
+    Methods:
+        Name resolution: ``load_name``, ``store_name``, ``delete_name``,
+        ``has_name``, ``load_builtin``.
+
+        Exception handling: ``handle_exception``.
+
+        Block navigation: ``get_block``, ``fallthrough_label``,
+        ``get_current_instruction``.
+
+        Dispatch loop: ``dispatch_current_instruction``.
+
+        Instruction stubs: all ``dispatch_*`` methods raise
+        ``NotImplementedError``; subclasses override them.
     """
 
     def __init__(
         self,
         interpreter: Interpreter,
         function: Function,
-        function_ir: Region,
-        globals: Namespace,
         locals: Namespace,
-        cells: Dict[str, Cell],
-        temps: Optional[Dict[TemporaryValue, Any]] = None,
+        globals: Namespace,
         block_label: Optional[BasicBlockLabel] = None,
         instr_index: int = 0,
-        finished: bool = False,
-        return_value: Any = None,
-        current_exception: Optional[BaseException] = None,
-        exc_stack: Optional[List[BaseException]] = None,
-        pending_send_value: Any = _UNSET,
+        cells: Optional[Dict[str, Cell]] = None,
         try_stack: Optional[List[TryStackEntry]] = None,
-        pending_return_value: Any = _UNSET,
-        pending_jump_label: Any = _UNSET,
     ) -> None:
         self.interpreter = interpreter
         self.function = function
-        self.function_ir = function_ir
-        self.globals = globals
         self.locals = locals
-        self.cells = cells
-        self.temps = dict(temps or {})
-        self.block_label = block_label
+        self.globals = globals
+        self.block_label = block_label or self.function.region_ir.entry_label
         self.instr_index = instr_index
-        self.finished = finished
-        self.return_value = return_value
-        self.current_exception = current_exception
-        self.exc_stack = list(exc_stack or [])
-        self.pending_send_value = pending_send_value
+        self.cells = cells or {}
         self.try_stack = list(try_stack or [])
-        self.pending_return_value = pending_return_value
-        self.pending_jump_label = pending_jump_label
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def copy(self: FrameT) -> FrameT:
-        """Return a copy of this frame safe for independent execution.
-
-        ``interpreter``, ``globals``, ``function`` / ``function_ir``
-        are shared; everything else is deep-copied.
-
-        Uses ``type(self)`` so that subclasses preserve their own type.
-        """
-        return type(self)(
-            interpreter=self.interpreter,
-            function=self.function,
-            function_ir=self.function_ir,
-            globals=self.globals,
-            locals=dict(self.locals.items()),
-            cells={k: Cell(value=v.value) for k, v in self.cells.items()},
-            temps=dict(self.temps),
-            block_label=self.block_label,
-            instr_index=self.instr_index,
-            finished=self.finished,
-            return_value=self.return_value,
-            current_exception=self.current_exception,
-            exc_stack=list(self.exc_stack),
-            pending_send_value=self.pending_send_value,
-            try_stack=list(self.try_stack),
-            pending_return_value=self.pending_return_value,
-            pending_jump_label=self.pending_jump_label,
-        )
-
-    # ------------------------------------------------------------------
-    # Block / instruction navigation
-    # ------------------------------------------------------------------
-
-    def get_block(self, label: Optional[BasicBlockLabel] = None) -> BasicBlock:
-        if label is None:
-            label = self.block_label
-        for block in self.function_ir.basic_blocks:
-            if block.label == label:
-                return block
-        raise KeyError(
-            "unknown block label %r in %s" % (label, self.function_ir.name)
-        )
-
-    def fallthrough_label(
-        self, label: Optional[BasicBlockLabel] = None
-    ) -> Optional[BasicBlockLabel]:
-        if label is None:
-            label = self.block_label
-        basic_blocks = list(self.function_ir.basic_blocks)
-        for index, block in enumerate(basic_blocks):
-            if block.label == label and index + 1 < len(basic_blocks):
-                return basic_blocks[index + 1].label
-        return None
-
-    def get_current_instruction(self) -> Optional[Instruction]:
-        block = self.get_block()
-        if self.instr_index < len(block.instructions):
-            return block.instructions[self.instr_index]
-        return None
-
-    # ------------------------------------------------------------------
-    # Value helpers
-    # ------------------------------------------------------------------
-
-    def resolve_value(self, value: Any) -> Any:
-        if isinstance(value, TemporaryValue):
-            return self.temps[value]
-        if isinstance(value, BasicBlockLabel):
-            return value
-        if isinstance(value, RegionLabel):
-            return value
-        return value
+        self.finished = False
+        self.return_value: Any = None
+        self.current_exception: Optional[BaseException] = None
 
     # ------------------------------------------------------------------
     # Name resolution
     # ------------------------------------------------------------------
 
-    def load_var(self, scope: Scope, name: str) -> Any:
+    def load_name(self, scope: Scope, name: str) -> Any:
         if scope == Scope.LOCAL:
             if name in self.locals:
                 return self.locals[name]
@@ -904,7 +748,7 @@ class BaseFrame:
 
         raise NotImplementedError("unknown scope %r" % (scope,))
 
-    def store_var(self, scope: Scope, name: str, value: Any) -> None:
+    def store_name(self, scope: Scope, name: str, value: Any) -> None:
         if scope == Scope.GLOBAL:
             self.globals[name] = value
             return
@@ -914,7 +758,7 @@ class BaseFrame:
             return
         self.locals[name] = value
 
-    def delete_var(self, scope: Scope, name: str) -> None:
+    def delete_name(self, scope: Scope, name: str) -> None:
         if scope == Scope.GLOBAL:
             del self.globals[name]
             return
@@ -925,6 +769,15 @@ class BaseFrame:
             raise NameError(name)
         del self.locals[name]
 
+    def has_name(self, name: str) -> Optional[Scope]:
+        if name in self.locals:
+            return Scope.LOCAL
+        if name in self.cells and self.cells[name].value is not _UNSET:
+            return Scope.CELL
+        if name in self.globals:
+            return Scope.GLOBAL
+        return None
+
     def load_builtin(self, name: str) -> Any:
         builtins_obj = self.globals.get("__builtins__", builtins.__dict__)
         if isinstance(builtins_obj, dict):
@@ -934,45 +787,6 @@ class BaseFrame:
             if hasattr(builtins_obj, name):
                 return getattr(builtins_obj, name)
         raise NameError(name)
-
-    # ------------------------------------------------------------------
-    # Calls
-    # ------------------------------------------------------------------
-
-    def call_callee(
-        self, callee: Any, args: List[Any], kwargs: Dict[str, Any]
-    ) -> Any:
-        if callee is builtins.super and not args and not kwargs:
-            class_cell = self.cells.get("__class__")
-            if class_cell is None:
-                raise RuntimeError("super(): __class__ cell not found")
-            if class_cell.value is _UNSET:
-                raise RuntimeError("super(): empty __class__ cell")
-            if self.function_ir.argcount <= 0:
-                raise RuntimeError("super(): no arguments")
-            first_arg_name = self.function_ir.locals[0]
-            if first_arg_name in self.locals:
-                first_arg = self.locals[first_arg_name]
-            elif (
-                first_arg_name in self.cells
-                and self.cells[first_arg_name].value is not _UNSET
-            ):
-                first_arg = self.cells[first_arg_name].value
-            else:
-                raise RuntimeError("super(): arg[0] deleted")
-            return builtins.super(class_cell.value, first_arg)
-        if callee is builtins.globals and not args and not kwargs:
-            return self.globals
-        if callee is builtins.locals and not args and not kwargs:
-            return self.locals
-        if callee is builtins.vars and not kwargs:
-            if not args:
-                return self.locals
-            if len(args) == 1:
-                return vars(args[0])
-        if isinstance(callee, Function):
-            return self.interpreter.call(callee, tuple(args), kwargs)
-        return callee(*args, **kwargs)
 
     # ------------------------------------------------------------------
     # Exception handling
@@ -988,119 +802,6 @@ class BaseFrame:
             del self.try_stack[index:]
             return JumpEvent(target)
         return None
-
-    def handle_return(self, value: Any) -> ControlEvent:
-        for index in range(len(self.try_stack) - 1, -1, -1):
-            entry = self.try_stack[index]
-            target = entry.get("finally_label")
-            if target is None:
-                continue
-            self.pending_return_value = value
-            del self.try_stack[index:]
-            return JumpEvent(target)
-        self.pending_return_value = _UNSET
-        self.pending_jump_label = _UNSET
-        return ReturnEvent(value)
-
-    def handle_escape(self, target_label: BasicBlockLabel) -> JumpEvent:
-        for index in range(len(self.try_stack) - 1, -1, -1):
-            entry = self.try_stack[index]
-            finally_label = entry.get("finally_label")
-            if finally_label is None:
-                continue
-            self.pending_jump_label = target_label
-            del self.try_stack[index:]
-            return JumpEvent(finally_label)
-        self.pending_jump_label = _UNSET
-        self.pending_return_value = _UNSET
-        return JumpEvent(target_label)
-
-    def end_finally(self) -> Optional[ControlEvent]:
-        if self.current_exception is not None:
-            exc = self.current_exception
-            handled = self.handle_exception(exc)
-            if handled is not None:
-                return handled
-            raise exc
-        if self.pending_return_value is not _UNSET:
-            value = self.pending_return_value
-            self.pending_return_value = _UNSET
-            return self.handle_return(value)
-        if self.pending_jump_label is not _UNSET:
-            label = self.pending_jump_label
-            self.pending_jump_label = _UNSET
-            return self.handle_escape(label)
-        return None
-
-    # ------------------------------------------------------------------
-    # Execution loop
-    # ------------------------------------------------------------------
-
-    def resume(self, send_value: Any = None) -> StepEvent:
-        if self.finished:
-            return ReturnEvent(None)
-        if self.block_label is None:
-            self.block_label = self.function_ir.entry_label
-        self.pending_send_value = send_value
-
-        while not self.finished:
-            event = self.dispatch_current_instruction()
-            if event is not None:
-                return event
-
-        return ReturnEvent(self.return_value)
-
-    def run_to_completion(self) -> Any:
-        event = self.resume(send_value=None)
-        if not isinstance(event, ReturnEvent):
-            raise RuntimeError("frame yielded unexpectedly: %r" % (event,))
-        return event.value
-
-    # ------------------------------------------------------------------
-    # Generator / coroutine wrappers
-    # ------------------------------------------------------------------
-
-    def make_generator_object(self) -> Generator[Any, Any, Any]:
-        def generator() -> Generator[Any, Any, Any]:
-            send_value = None
-            while True:
-                event = self.resume(send_value=send_value)
-                if isinstance(event, YieldEvent):
-                    try:
-                        send_value = yield event.value
-                    except GeneratorExit:
-                        self.finished = True
-                        raise
-                elif isinstance(event, ReturnEvent):
-                    return event.value
-                else:
-                    raise RuntimeError(
-                        "unexpected generator event %r" % (event,)
-                    )
-
-        return generator()
-
-    def make_coroutine_object(self) -> Coroutine[Any, Any, Any]:
-        async def coroutine() -> Any:
-            return self.run_to_completion()
-
-        return coroutine()
-
-    def make_async_generator_object(self) -> AsyncGenerator[Any, Any]:
-        async def async_generator() -> AsyncGenerator[Any, Any]:
-            send_value = None
-            while True:
-                event = self.resume(send_value=send_value)
-                if isinstance(event, YieldEvent):
-                    send_value = yield event.value
-                elif isinstance(event, ReturnEvent):
-                    return
-                else:
-                    raise RuntimeError(
-                        "unexpected async generator event %r" % (event,)
-                    )
-
-        return async_generator()
 
     # ===================================================================
     # Instruction handler stubs  (self, instr) -> event | None
@@ -1284,6 +985,37 @@ class BaseFrame:
         raise NotImplementedError
 
     # ------------------------------------------------------------------
+    # Block / instruction navigation
+    # ------------------------------------------------------------------
+
+    def get_block(self, label: Optional[BasicBlockLabel] = None) -> BasicBlock:
+        if label is None:
+            label = self.block_label
+        for block in self.function.region_ir.basic_blocks:
+            if block.label == label:
+                return block
+        raise KeyError(
+            "unknown block label %r in %s" % (label, self.function.region_ir.name)
+        )
+
+    def fallthrough_label(
+        self, label: Optional[BasicBlockLabel] = None
+    ) -> Optional[BasicBlockLabel]:
+        if label is None:
+            label = self.block_label
+        basic_blocks = list(self.function.region_ir.basic_blocks)
+        for index, block in enumerate(basic_blocks):
+            if block.label == label and index + 1 < len(basic_blocks):
+                return basic_blocks[index + 1].label
+        return None
+
+    def get_current_instruction(self) -> Optional[Instruction]:
+        block = self.get_block()
+        if self.instr_index < len(block.instructions):
+            return block.instructions[self.instr_index]
+        return None
+
+    # ------------------------------------------------------------------
     # Instruction dispatch
     # ------------------------------------------------------------------
 
@@ -1301,7 +1033,7 @@ class BaseFrame:
             if self.finished:
                 return ReturnEvent(None)
             if self.block_label is None:
-                self.block_label = self.function_ir.entry_label
+                self.block_label = self.function.region_ir.entry_label
 
             block = self.get_block()
             if self.instr_index >= len(block.instructions):
@@ -1457,12 +1189,213 @@ class BaseFrame:
 
 
 class Frame(BaseFrame):
-    """Full implementation of all 52 interpreter instruction handlers.
+    """Full concrete interpreter frame.
 
-    Extends ``BaseFrame`` with concrete ``dispatch_*`` methods.
-    Subclass ``BaseFrame`` directly when you want to build a custom
-    interpreter with incremental handler implementations.
+    Provides all state fields, lifecycle methods, helper utilities, and
+    concrete ``dispatch_*`` implementations.
     """
+
+    def __init__(
+        self,
+        interpreter: Interpreter,
+        function: Function,
+        globals: Namespace,
+        locals: Namespace,
+        cells: Dict[str, Cell],
+        temps: Optional[Dict[TemporaryValue, Any]] = None,
+        block_label: Optional[BasicBlockLabel] = None,
+        instr_index: int = 0,
+        finished: bool = False,
+        return_value: Any = None,
+        current_exception: Optional[BaseException] = None,
+        exc_stack: Optional[List[BaseException]] = None,
+        pending_send_value: Any = _UNSET,
+        try_stack: Optional[List[TryStackEntry]] = None,
+        pending_return_value: Any = _UNSET,
+        pending_jump_label: Any = _UNSET,
+    ) -> None:
+        super().__init__(
+            interpreter=interpreter,
+            function=function,
+            locals=locals,
+            globals=globals,
+            block_label=block_label,
+            instr_index=instr_index,
+            cells=cells,
+            try_stack=try_stack,
+        )
+        self.temps = dict(temps or {})
+        self.finished = finished
+        self.return_value = return_value
+        self.current_exception = current_exception
+        self.exc_stack = list(exc_stack or [])
+        self.pending_send_value = pending_send_value
+        self.pending_return_value = pending_return_value
+        self.pending_jump_label = pending_jump_label
+
+    # ------------------------------------------------------------------
+    # Execution loop
+    # ------------------------------------------------------------------
+
+    def resume(self, send_value: Any = None) -> StepEvent:
+        if self.finished:
+            return ReturnEvent(None)
+        if self.block_label is None:
+            self.block_label = self.function.region_ir.entry_label
+        self.pending_send_value = send_value
+
+        while not self.finished:
+            event = self.dispatch_current_instruction()
+            if event is not None:
+                return event
+
+        return ReturnEvent(self.return_value)
+
+    def run_to_completion(self) -> Any:
+        event = self.resume(send_value=None)
+        if not isinstance(event, ReturnEvent):
+            raise RuntimeError("frame yielded unexpectedly: %r" % (event,))
+        return event.value
+
+    # ------------------------------------------------------------------
+    # Generator / coroutine wrappers
+    # ------------------------------------------------------------------
+
+    def make_generator_object(self) -> Generator[Any, Any, Any]:
+        def generator() -> Generator[Any, Any, Any]:
+            send_value = None
+            while True:
+                event = self.resume(send_value=send_value)
+                if isinstance(event, YieldEvent):
+                    try:
+                        send_value = yield event.value
+                    except GeneratorExit:
+                        self.finished = True
+                        raise
+                elif isinstance(event, ReturnEvent):
+                    return event.value
+                else:
+                    raise RuntimeError(
+                        "unexpected generator event %r" % (event,)
+                    )
+
+        return generator()
+
+    def make_coroutine_object(self) -> Coroutine[Any, Any, Any]:
+        async def coroutine() -> Any:
+            return self.run_to_completion()
+
+        return coroutine()
+
+    def make_async_generator_object(self) -> AsyncGenerator[Any, Any]:
+        async def async_generator() -> AsyncGenerator[Any, Any]:
+            send_value = None
+            while True:
+                event = self.resume(send_value=send_value)
+                if isinstance(event, YieldEvent):
+                    send_value = yield event.value
+                elif isinstance(event, ReturnEvent):
+                    return
+                else:
+                    raise RuntimeError(
+                        "unexpected async generator event %r" % (event,)
+                    )
+
+        return async_generator()
+
+    # ------------------------------------------------------------------
+    # Calls
+    # ------------------------------------------------------------------
+
+    def call_callee(
+        self, callee: Any, args: List[Any], kwargs: Dict[str, Any]
+    ) -> Any:
+        if callee is builtins.super and not args and not kwargs:
+            class_cell = self.cells.get("__class__")
+            if class_cell is None:
+                raise RuntimeError("super(): __class__ cell not found")
+            if class_cell.value is _UNSET:
+                raise RuntimeError("super(): empty __class__ cell")
+            if self.function.region_ir.argcount <= 0:
+                raise RuntimeError("super(): no arguments")
+            first_arg_name = self.function.region_ir.locals[0]
+            if first_arg_name in self.locals:
+                first_arg = self.locals[first_arg_name]
+            elif (
+                first_arg_name in self.cells
+                and self.cells[first_arg_name].value is not _UNSET
+            ):
+                first_arg = self.cells[first_arg_name].value
+            else:
+                raise RuntimeError("super(): arg[0] deleted")
+            return builtins.super(class_cell.value, first_arg)
+        if callee is builtins.globals and not args and not kwargs:
+            return self.globals
+        if callee is builtins.locals and not args and not kwargs:
+            return self.locals
+        if callee is builtins.vars and not kwargs:
+            if not args:
+                return self.locals
+            if len(args) == 1:
+                return vars(args[0])
+        if isinstance(callee, Function):
+            frame = self.interpreter.make_frame(callee, tuple(args), kwargs)
+            flags = callee.region_ir.flags
+            if flags & inspect.CO_ASYNC_GENERATOR:
+                return frame.make_async_generator_object()
+            if flags & inspect.CO_COROUTINE:
+                return frame.make_coroutine_object()
+            if flags & inspect.CO_GENERATOR:
+                return frame.make_generator_object()
+            return frame.run_to_completion()
+        return callee(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Exception handling
+    # ------------------------------------------------------------------
+
+    def handle_return(self, value: Any) -> ControlEvent:
+        for index in range(len(self.try_stack) - 1, -1, -1):
+            entry = self.try_stack[index]
+            target = entry.get("finally_label")
+            if target is None:
+                continue
+            self.pending_return_value = value
+            del self.try_stack[index:]
+            return JumpEvent(target)
+        self.pending_return_value = _UNSET
+        self.pending_jump_label = _UNSET
+        return ReturnEvent(value)
+
+    def handle_escape(self, target_label: BasicBlockLabel) -> JumpEvent:
+        for index in range(len(self.try_stack) - 1, -1, -1):
+            entry = self.try_stack[index]
+            finally_label = entry.get("finally_label")
+            if finally_label is None:
+                continue
+            self.pending_jump_label = target_label
+            del self.try_stack[index:]
+            return JumpEvent(finally_label)
+        self.pending_jump_label = _UNSET
+        self.pending_return_value = _UNSET
+        return JumpEvent(target_label)
+
+    def end_finally(self) -> Optional[ControlEvent]:
+        if self.current_exception is not None:
+            exc = self.current_exception
+            handled = self.handle_exception(exc)
+            if handled is not None:
+                return handled
+            raise exc
+        if self.pending_return_value is not _UNSET:
+            value = self.pending_return_value
+            self.pending_return_value = _UNSET
+            return self.handle_return(value)
+        if self.pending_jump_label is not _UNSET:
+            label = self.pending_jump_label
+            self.pending_jump_label = _UNSET
+            return self.handle_escape(label)
+        return None
 
     # ===================================================================
     # Instruction handler methods  (self, instr) -> event | None
@@ -1475,71 +1408,71 @@ class Frame(BaseFrame):
         return None
 
     def dispatch_load_name(self, instr: LoadName) -> None:
-        self.temps[instr.dst] = self.load_var(instr.scope, instr.name)
+        self.temps[instr.dst] = self.load_name(instr.scope, instr.name)
         return None
 
     def dispatch_store_name(self, instr: StoreName) -> None:
-        self.store_var(instr.scope, instr.name, self.resolve_value(instr.src))
+        self.store_name(instr.scope, instr.name, self.temps[instr.src])
         return None
 
     def dispatch_delete_name(self, instr: DeleteName) -> None:
-        self.delete_var(instr.scope, instr.name)
+        self.delete_name(instr.scope, instr.name)
         return None
 
     # --- computation ---
 
     def dispatch_unary_op(self, instr: UnaryOp) -> None:
         self.temps[instr.dst] = apply_unary(
-            instr.op, self.resolve_value(instr.src)
+            instr.op, self.temps[instr.src]
         )
         return None
 
     def dispatch_binary_op(self, instr: BinaryOp) -> None:
-        lhs = self.resolve_value(instr.lhs)
-        rhs = self.resolve_value(instr.rhs)
+        lhs = self.temps[instr.lhs]
+        rhs = self.temps[instr.rhs]
         self.temps[instr.dst] = apply_binary(instr.op, lhs, rhs)
         return None
 
     def dispatch_compare_op(self, instr: CompareOp) -> None:
-        lhs = self.resolve_value(instr.lhs)
-        rhs = self.resolve_value(instr.rhs)
+        lhs = self.temps[instr.lhs]
+        rhs = self.temps[instr.rhs]
         self.temps[instr.dst] = apply_compare(instr.cmp, lhs, rhs)
         return None
 
     # --- attribute / item access ---
 
     def dispatch_load_attr(self, instr: LoadAttr) -> None:
-        obj = self.resolve_value(instr.obj)
+        obj = self.temps[instr.obj]
         self.temps[instr.dst] = getattr(obj, instr.attr_name)
         return None
 
     def dispatch_store_attr(self, instr: StoreAttr) -> None:
         setattr(
-            self.resolve_value(instr.obj),
+            self.temps[instr.obj],
             instr.attr_name,
-            self.resolve_value(instr.value),
+            self.temps[instr.value],
         )
         return None
 
     def dispatch_delete_attr(self, instr: DeleteAttr) -> None:
-        delattr(self.resolve_value(instr.obj), instr.attr_name)
+        delattr(self.temps[instr.obj], instr.attr_name)
         return None
 
     def dispatch_load_item(self, instr: LoadItem) -> None:
-        obj = self.resolve_value(instr.obj)
-        key = self.resolve_value(instr.key)
+        obj = self.temps[instr.obj]
+        key = self.temps[instr.key]
         self.temps[instr.dst] = obj[key]
         return None
 
     def dispatch_store_item(self, instr: StoreItem) -> None:
-        obj = self.resolve_value(instr.obj)
-        key = self.resolve_value(instr.key)
-        value = self.resolve_value(instr.value)
+        obj = self.temps[instr.obj]
+        key = self.temps[instr.key]
+        value = self.temps[instr.value]
         obj[key] = value
         return None
 
     def dispatch_delete_item(self, instr: DeleteItem) -> None:
-        del self.resolve_value(instr.obj)[self.resolve_value(instr.key)]
+        del self.temps[instr.obj][self.temps[instr.key]]
         return None
 
     # --- aggregates ---
@@ -1548,9 +1481,9 @@ class Frame(BaseFrame):
         built = []
         for item in instr.items:
             if isinstance(item, UnpackedTemporaryValue):
-                built.extend(self.resolve_value(item.value))
+                built.extend(self.temps[item.value])
             else:
-                built.append(self.resolve_value(item))
+                built.append(self.temps[item])
         self.temps[instr.dst] = tuple(built)
         return None
 
@@ -1558,9 +1491,9 @@ class Frame(BaseFrame):
         built = []
         for item in instr.items:
             if isinstance(item, UnpackedTemporaryValue):
-                built.extend(self.resolve_value(item.value))
+                built.extend(self.temps[item.value])
             else:
-                built.append(self.resolve_value(item))
+                built.append(self.temps[item])
         self.temps[instr.dst] = built
         return None
 
@@ -1568,9 +1501,9 @@ class Frame(BaseFrame):
         built = set()
         for item in instr.items:
             if isinstance(item, UnpackedTemporaryValue):
-                built.update(self.resolve_value(item.value))
+                built.update(self.temps[item.value])
             else:
-                built.add(self.resolve_value(item))
+                built.add(self.temps[item])
         self.temps[instr.dst] = built
         return None
 
@@ -1578,28 +1511,28 @@ class Frame(BaseFrame):
         built = {}
         for key, value in instr.items:
             if key is None:
-                built.update(dict(self.resolve_value(value)))
+                built.update(dict(self.temps[value]))
             else:
-                built[self.resolve_value(key)] = self.resolve_value(value)
+                built[self.temps[key]] = self.temps[value]
         self.temps[instr.dst] = built
         return None
 
     def dispatch_build_slice(self, instr: BuildSlice) -> None:
         self.temps[instr.dst] = slice(
-            self.resolve_value(instr.start),
-            self.resolve_value(instr.stop),
-            None if instr.step is None else self.resolve_value(instr.step),
+            self.temps[instr.start],
+            self.temps[instr.stop],
+            None if instr.step is None else self.temps[instr.step],
         )
         return None
 
     def dispatch_build_string(self, instr: BuildString) -> None:
         self.temps[instr.dst] = "".join(
-            str(self.resolve_value(part)) for part in instr.parts
+            str(self.temps[part]) for part in instr.parts
         )
         return None
 
     def dispatch_format_value(self, instr: FormatValue) -> None:
-        value = self.resolve_value(instr.value)
+        value = self.temps[instr.value]
         if instr.conversion == "repr":
             value = repr(value)
         elif instr.conversion == "ascii":
@@ -1607,12 +1540,12 @@ class Frame(BaseFrame):
         else:
             value = str(value)
         if instr.spec is not None:
-            value = format(value, self.resolve_value(instr.spec))
+            value = format(value, self.temps[instr.spec])
         self.temps[instr.dst] = value
         return None
 
     def dispatch_unpack(self, instr: Unpack) -> None:
-        values = list(self.resolve_value(instr.src))
+        values = list(self.temps[instr.src])
         if instr.star_index is None:
             if len(values) != len(instr.dsts):
                 raise ValueError("unpack mismatch")
@@ -1639,16 +1572,16 @@ class Frame(BaseFrame):
     # --- calls / imports / functions / classes ---
 
     def dispatch_call(self, instr: Call) -> None:
-        callee = self.resolve_value(instr.callee)
+        callee = self.temps[instr.callee]
         args = []
         for arg in instr.args:
             if isinstance(arg, UnpackedTemporaryValue):
-                args.extend(self.resolve_value(arg.value))
+                args.extend(self.temps[arg.value])
             else:
-                args.append(self.resolve_value(arg))
+                args.append(self.temps[arg])
         kwargs = {}
         for name, value in instr.kwargs:
-            resolved = self.resolve_value(value)
+            resolved = self.temps[value]
             if name is None:
                 for key, item in dict(resolved).items():
                     if key in kwargs:
@@ -1672,12 +1605,12 @@ class Frame(BaseFrame):
         return None
 
     def dispatch_import_from(self, instr: ImportFrom) -> None:
-        module_obj = self.resolve_value(instr.module_obj)
+        module_obj = self.temps[instr.module_obj]
         self.temps[instr.dst] = getattr(module_obj, instr.name)
         return None
 
     def dispatch_import_star(self, instr: ImportStar) -> None:
-        module_obj = self.resolve_value(instr.module_obj)
+        module_obj = self.temps[instr.module_obj]
         export_names = getattr(module_obj, "__all__", None)
         if export_names is None:
             export_names = [
@@ -1688,32 +1621,25 @@ class Frame(BaseFrame):
         return None
 
     def dispatch_make_function(self, instr: MakeFunction) -> None:
-        region = self.function.get_child_region(instr.code)
+        region = next(
+            r for r in self.function.region_ir.child_regions if r.label == instr.code
+        )
         closure = {}
         for name in region.freevars:
             if name in self.cells:
                 closure[name] = self.cells[name]
-        child_name = region.name.split("#", 1)[0]
-        parent_qualname = self.function.__qualname__
-        if self.function_ir.name == "<module>":
-            qualname = child_name
-        elif self.function_ir.is_class:
-            qualname = "%s.%s" % (parent_qualname, child_name)
-        else:
-            qualname = "%s.<locals>.%s" % (parent_qualname, child_name)
         fn = Function(
             region_ir=region,
             globals_dict=self.globals,
             closure_cells=closure,
-            qualname=qualname,
             __defaults__=(
-                tuple(self.resolve_value(value) for value in instr.defaults)
+                tuple(self.temps[value] for value in instr.defaults)
                 if instr.defaults
                 else None
             ),
             __kwdefaults__=(
                 {
-                    name: self.resolve_value(value)
+                    name: self.temps[value]
                     for name, value in instr.kwdefaults
                 }
                 if instr.kwdefaults
@@ -1721,7 +1647,7 @@ class Frame(BaseFrame):
             ),
             __annotations__=(
                 {
-                    name: self.resolve_value(value)
+                    name: self.temps[value]
                     for name, value in instr.annotations
                 }
                 if instr.annotations
@@ -1732,10 +1658,10 @@ class Frame(BaseFrame):
         return None
 
     def dispatch_build_class(self, instr: BuildClass) -> None:
-        body = self.resolve_value(instr.body_func)
-        name = self.resolve_value(instr.name)
-        bases = [self.resolve_value(base) for base in instr.bases]
-        keywords = {n: self.resolve_value(v) for n, v in instr.keywords}
+        body = self.temps[instr.body_func]
+        name = self.temps[instr.name]
+        bases = [self.temps[base] for base in instr.bases]
+        keywords = {n: self.temps[v] for n, v in instr.keywords}
         self.temps[instr.dst] = self.interpreter.build_class(
             body, name, *bases, **keywords
         )
@@ -1744,11 +1670,11 @@ class Frame(BaseFrame):
     # --- iteration / async ---
 
     def dispatch_get_iter(self, instr: GetIter) -> None:
-        self.temps[instr.dst] = iter(self.resolve_value(instr.iterable))
+        self.temps[instr.dst] = iter(self.temps[instr.iterable])
         return None
 
     def dispatch_for_iter(self, instr: ForIter) -> JumpEvent:
-        iterator = self.resolve_value(instr.iter_obj)
+        iterator = self.temps[instr.iter_obj]
         try:
             value = next(iterator)
         except StopIteration:
@@ -1757,20 +1683,20 @@ class Frame(BaseFrame):
         return JumpEvent(instr.body_label)
 
     def dispatch_get_aiter(self, instr: GetAIter) -> None:
-        self.temps[instr.dst] = self.resolve_value(instr.iterable).__aiter__()
+        self.temps[instr.dst] = self.temps[instr.iterable].__aiter__()
         return None
 
     def dispatch_get_anext(self, instr: GetANext) -> None:
-        self.temps[instr.dst] = self.resolve_value(instr.aiter).__anext__()
+        self.temps[instr.dst] = self.temps[instr.aiter].__anext__()
         return None
 
     def dispatch_get_awaitable(self, instr: GetAwaitable) -> None:
-        value = self.resolve_value(instr.value)
+        value = self.temps[instr.value]
         self.temps[instr.dst] = value if inspect.isawaitable(value) else value
         return None
 
     def dispatch_yield_value(self, instr: YieldValue) -> YieldEvent:
-        yielded = self.resolve_value(instr.value)
+        yielded = self.temps[instr.value]
         sent_value = (
             None if self.pending_send_value is _UNSET else self.pending_send_value
         )
@@ -1779,12 +1705,12 @@ class Frame(BaseFrame):
         return YieldEvent(yielded)
 
     def dispatch_yield_from(self, instr: YieldFrom) -> YieldEvent:
-        yielded = self.resolve_value(instr.value)
+        yielded = self.temps[instr.value]
         self.temps[instr.dst] = None
         return YieldEvent(yielded)
 
     def dispatch_await_value(self, instr: AwaitValue) -> None:
-        self.temps[instr.dst] = await_sync(self.resolve_value(instr.value))
+        self.temps[instr.dst] = await_sync(self.temps[instr.value])
         return None
 
     # --- exceptions ---
@@ -1794,10 +1720,10 @@ class Frame(BaseFrame):
         return None
 
     def dispatch_raise(self, instr: Raise) -> None:
-        exc = normalize_exception_for_raise(self.resolve_value(instr.exc))
+        exc = normalize_exception_for_raise(self.temps[instr.exc])
         if instr.cause is not None:
             cause = normalize_exception_for_raise(
-                self.resolve_value(instr.cause), allow_none=True
+                self.temps[instr.cause], allow_none=True
             )
             exc.__cause__ = cause
             exc.__suppress_context__ = True
@@ -1809,8 +1735,8 @@ class Frame(BaseFrame):
         raise self.current_exception
 
     def dispatch_check_exc_match(self, instr: CheckExcMatch) -> None:
-        exc = self.resolve_value(instr.exc)
-        typ = self.resolve_value(instr.typ)
+        exc = self.temps[instr.exc]
+        typ = self.temps[instr.typ]
         self.temps[instr.dst] = check_exception_match(exc, typ)
         return None
 
@@ -1850,23 +1776,23 @@ class Frame(BaseFrame):
         return JumpEvent(instr.target)
 
     def dispatch_branch(self, instr: Branch) -> JumpEvent:
-        cond = self.resolve_value(instr.cond)
+        cond = self.temps[instr.cond]
         return JumpEvent(instr.true_label if cond else instr.false_label)
 
     def dispatch_return(self, instr: Return) -> ControlEvent:
-        value = self.resolve_value(instr.value)
+        value = self.temps[instr.value]
         self.current_exception = None
         return self.handle_return(value)
 
     # --- pattern matching ---
 
     def dispatch_match_mapping(self, instr: MatchMapping) -> None:
-        value = self.resolve_value(instr.value)
+        value = self.temps[instr.value]
         self.temps[instr.dst] = isinstance(value, abc.Mapping)
         return None
 
     def dispatch_match_sequence(self, instr: MatchSequence) -> None:
-        value = self.resolve_value(instr.value)
+        value = self.temps[instr.value]
         self.temps[instr.dst] = (
             isinstance(value, abc.Sequence)
             and not isinstance(value, (str, bytes, bytearray))
@@ -1874,8 +1800,8 @@ class Frame(BaseFrame):
         return None
 
     def dispatch_match_keys(self, instr: MatchKeys) -> None:
-        mapping = self.resolve_value(instr.mapping)
-        keys = self.resolve_value(instr.keys)
+        mapping = self.temps[instr.mapping]
+        keys = self.temps[instr.keys]
         try:
             result = tuple(mapping[key] for key in keys)
         except Exception:
@@ -1884,8 +1810,8 @@ class Frame(BaseFrame):
         return None
 
     def dispatch_match_class(self, instr: MatchClass) -> None:
-        value = self.resolve_value(instr.value)
-        cls = self.resolve_value(instr.cls)
+        value = self.temps[instr.value]
+        cls = self.temps[instr.cls]
         self.temps[instr.dst] = isinstance(value, cls)
         return None
 
@@ -1913,7 +1839,7 @@ def bind_arguments(
 
     if len(args) > len(positional_names) and region.vararg_name is None:
         raise TypeError(
-            "too many positional arguments for %s" % (function.__qualname__,)
+            "too many positional arguments for %s" % (function.__name__,)
         )
 
     consumed_positional = positional_names[
@@ -1926,14 +1852,14 @@ def bind_arguments(
     if posonly_keyword_names:
         raise TypeError(
             "positional-only arguments passed by keyword for %s: %s"
-            % (function.__qualname__, sorted(posonly_keyword_names))
+            % (function.__name__, sorted(posonly_keyword_names))
         )
 
     duplicate_names = [name for name in consumed_positional if name in kwargs]
     if duplicate_names:
         raise TypeError(
             "multiple values for arguments for %s: %s"
-            % (function.__qualname__, sorted(duplicate_names))
+            % (function.__name__, sorted(duplicate_names))
         )
 
     for name in positional_names[len(consumed_positional) :]:
@@ -1948,7 +1874,7 @@ def bind_arguments(
     for name in positional_names:
         if name not in bound:
             raise TypeError(
-                "missing argument %r for %s" % (name, function.__qualname__)
+                "missing argument %r for %s" % (name, function.__name__)
             )
 
     extra_args = args[len(positional_names) :]
@@ -1963,7 +1889,7 @@ def bind_arguments(
         else:
             raise TypeError(
                 "missing keyword-only argument %r for %s"
-                % (name, function.__qualname__)
+                % (name, function.__name__)
             )
 
     if region.kwarg_name is not None:
@@ -1971,7 +1897,7 @@ def bind_arguments(
     elif kwargs:
         raise TypeError(
             "unexpected keyword arguments for %s: %s"
-            % (function.__qualname__, sorted(kwargs))
+            % (function.__name__, sorted(kwargs))
         )
 
     return bound

@@ -27,12 +27,14 @@ Dependencies:
 
 The quickest end-to-end workflow is: compile source to IR, inspect the IR, run the module, then materialize a frame and step it instruction by instruction.
 
+To run a module, wrap its IR in a `Function`, create a frame with `make_frame`, and dispatch instructions in a loop. For instruction-level stepping, use `get_current_instruction()` and `dispatch_current_instruction()` directly.
+
 ```python
 import sys
 
 from pyssa.compiler import compile_source, new_compiler_state
 from pyssa.ir import print_region_ir
-from pyssa.interpreter import Interpreter
+from pyssa.interpreter import Function, Interpreter
 
 source = '''
 def make_adder(n=0):
@@ -51,36 +53,36 @@ module_ir = compile_source(new_compiler_state(), source, path='<example>')
 print_region_ir(module_ir)
 
 # 3. Run the module normally
+module_fn = Function(region_ir=module_ir, globals_dict={})
 interp = Interpreter(search_path=list(sys.path))
-namespace = interp.run_module(module_ir, globals={})
-print(namespace["result"])   # 16
+module_frame = interp.make_frame(module_fn, (), {})
+while not module_frame.finished:
+    module_event = module_frame.dispatch_current_instruction()
+    if module_event is not None:
+        break
+print(module_frame.locals["result"])   # 16
 
 # 4. Step through one call instruction by instruction
-f = namespace["f"]
+f = module_frame.locals["f"]
 print(f.__defaults__)         # (1,)
 
-frame = interp.make_frame(f, (100,), {})
-while not frame.finished:
-    instr = frame.get_current_instruction()
-    print(f"L{frame.block_label.index}:{frame.instr_index}  {type(instr).__name__}")
+call_frame = interp.make_frame(f, (100,), {})
+while not call_frame.finished:
+    instr = call_frame.get_current_instruction()
+    print(f"L{call_frame.block_label.index}:{call_frame.instr_index}  {type(instr).__name__}")
 
-    event = frame.dispatch_current_instruction()
-    if event is not None:
-        print(f"returned: {event.value}")  # 111
+    call_event = call_frame.dispatch_current_instruction()
+    if call_event is not None:
+        print(f"returned: {call_event.value}")  # 111
         break
 ```
 
-`Interpreter.run_module(...)` and `Interpreter.call(...)` use a frame's `resume()` internally. For instruction-level stepping, use `get_current_instruction()` and `dispatch_current_instruction()` directly.
 
 ## Building Custom Interpreters
 
-`Interpreter` itself no longer takes a `frame_class=` constructor argument. Instead, choose the frame type at the execution entrypoint:
+Choose the frame type when creating a frame:
 
-- `interp.run_module(..., frame_class=MyFrame)`
 - `interp.make_frame(..., frame_class=MyFrame)`
-- `interp.call(..., frame_class=MyFrame)`
-
-Nested execution triggered by that frame continues to use the same frame subclass automatically.
 
 A simple way to customize execution is to subclass the concrete `Frame`, intercept each instruction, and then delegate to the normal implementation. You can still execute the resulting frame step by step:
 
@@ -88,7 +90,7 @@ A simple way to customize execution is to subclass the concrete `Frame`, interce
 import sys
 
 from pyssa.compiler import compile_source, new_compiler_state
-from pyssa.interpreter import Frame, Interpreter
+from pyssa.interpreter import Frame, Function, Interpreter
 
 class TracingFrame(Frame):
     def dispatch_current_instruction(self):
@@ -106,59 +108,73 @@ def square(x):
 '''
 
 module_ir = compile_source(new_compiler_state(), source, path='<trace>')
+module_fn = Function(region_ir=module_ir, globals_dict={})
 interp = Interpreter(search_path=list(sys.path))
-namespace = interp.run_module(module_ir, globals={}, frame_class=TracingFrame)
+trace_frame = interp.make_frame(module_fn, (), {}, frame_class=TracingFrame)
+while not trace_frame.finished:
+    trace_event = trace_frame.dispatch_current_instruction()
+    if trace_event is not None:
+        break
 
 # For manual stepping, request the same frame class explicitly.
-frame = interp.make_frame(namespace["square"], (7,), {}, frame_class=TracingFrame)
-while not frame.finished:
-    event = frame.dispatch_current_instruction()
-    if event is not None:
-        print(event.value)  # 49
+step_frame = interp.make_frame(trace_frame.locals["square"], (7,), {}, frame_class=TracingFrame)
+while not step_frame.finished:
+    step_event = step_frame.dispatch_current_instruction()
+    if step_event is not None:
+        print(step_event.value)  # 49
         break
 ```
 
-If you want to define instruction semantics yourself, subclass `BaseFrame` instead of `Frame`. What `BaseFrame` does **not** implement is the instruction semantics themselves: its `dispatch_*` methods raise `NotImplementedError`. That lets you implement handlers incrementally and fail loudly when a missing instruction is executed.
+If you want to define instruction semantics from scratch, subclass `BaseFrame`. It provides:
+
+- **Fields**: `interpreter`, `function`, `locals`, `globals`, `block_label`, `instr_index`, `cells`, `try_stack`, `finished`, `return_value`, `current_exception`
+- **Name resolution**: `load_name`, `store_name`, `delete_name`, `has_name`, `load_builtin`
+- **Exception handling**: `handle_exception`
+- **Block navigation**: `get_block`, `fallthrough_label`, `get_current_instruction`
+- **Dispatch loop**: `dispatch_current_instruction`
+- **Instruction stubs**: all `dispatch_*` methods raise `NotImplementedError`
+
+Supply additional state in your `__init__` and implement only the handlers you need. Using `make_frame` directly with a `Function` wrapping the module IR allows symbolically executing only portions of modules:
 
 ```python
 from pyssa.compiler import compile_source, new_compiler_state
-from pyssa.interpreter import BaseFrame, Interpreter
+from pyssa.interpreter import BaseFrame, Function, Interpreter, ReturnEvent
 
 class TinyAddOnlyFrame(BaseFrame):
     """Enough for a tiny add-only subset."""
+
+    def __init__(self, interpreter, function, globals, locals, cells, block_label=None, instr_index=0):
+        super().__init__(interpreter, function, locals, globals, block_label, instr_index, cells)
+        self.temps = {}
 
     def dispatch_const(self, instr):
         self.temps[instr.dst] = instr.value
 
     def dispatch_load_name(self, instr):
-        self.temps[instr.dst] = self.load_var(instr.scope, instr.name)
+        self.temps[instr.dst] = self.load_name(instr.scope, instr.name)
 
     def dispatch_store_name(self, instr):
-        self.store_var(instr.scope, instr.name, self.resolve_value(instr.src))
+        self.store_name(instr.scope, instr.name, self.temps[instr.src])
 
     def dispatch_binary_op(self, instr):
         if instr.op != "+":
             raise NotImplementedError("TinyAddOnlyFrame only supports addition")
-        lhs = self.resolve_value(instr.lhs)
-        rhs = self.resolve_value(instr.rhs)
-        self.temps[instr.dst] = lhs + rhs
+        self.temps[instr.dst] = self.temps[instr.lhs] + self.temps[instr.rhs]
 
     def dispatch_return(self, instr):
-        return self.handle_return(self.resolve_value(instr.value))
+        return ReturnEvent(self.temps[instr.value])
 
 source = "result = x + y"
 module_ir = compile_source(new_compiler_state(), source, path="<tiny-add>")
-
+module_function = Function(region_ir=module_ir, globals_dict={"x": 2, "y": 3})
 interp = Interpreter()
-namespace = interp.run_module(
-    module_ir,
-    globals={"x": 2, "y": 3},
-    frame_class=TinyAddOnlyFrame,
-)
-print(namespace["result"])  # 5
+add_frame = interp.make_frame(module_function, (), {}, frame_class=TinyAddOnlyFrame)
+while not add_frame.finished:
+    add_event = add_frame.dispatch_current_instruction()
+    if add_event is not None:
+        break
+print(add_frame.locals["result"])  # 5
 ```
-
-If you want to invoke a `Function` directly without materializing a frame yourself, use `interp.call(fn, args, kwargs, frame_class=MyFrame)`.
 
 ## IR overview
 
@@ -316,3 +332,4 @@ The pyssa-based implementation is the smallest by LOC. With pyssa, the hard part
 | `pattern` variants | Partial | value/singleton/or/as, sequence, mapping, class patterns |
 | `type_ignore` | Ignored | |
 | `type_param` variants | Not yet | |
+

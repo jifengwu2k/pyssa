@@ -1696,7 +1696,7 @@ def lower_try(
 
 
 def lower_try_star(
-    state: CompilerState, ctx: RegionContext, stmt: ast.TryStar
+    state: CompilerState, ctx: RegionContext, stmt: ast.Try
 ) -> List[Region]:
     nested_regions = []
     # Exception groups use the same explicit CFG shape as `try`, but handler tests go through
