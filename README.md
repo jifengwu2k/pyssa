@@ -1,6 +1,6 @@
 # pyssa
 
-A Python AST-to-IR compiler and interpreter with pluggable execution semantics.
+A Python IR with pluggable execution semantics.
 
 ## Motivation
 
@@ -9,7 +9,7 @@ A Python AST-to-IR compiler and interpreter with pluggable execution semantics.
 1. a Python-version-agnostic bytecode-like IR for analysis
 2. custom interpreters that mostly behave like Python, but intentionally diverge in specific places
 
-The project lowers Python AST into an explicit control-flow IR with nested regions, basic blocks, and ordinary operations. The goal is not fidelity to CPython bytecode quirks. The goal is a stable, executable semantic IR that is easier to analyze, easier to transform, and easier to reinterpret with custom execution rules.
+It lowers Python AST into an explicit control-flow IR with nested regions, basic blocks, and ordinary operations. The goal is a stable, executable semantic IR that is easier to analyze, easier to transform, and easier to reinterpret with custom execution rules.
 
 ## Installation
 
@@ -23,157 +23,97 @@ Dependencies:
 - `cowlist`
 - `typing_extensions`
 
-## Quickstart: compile, run, and step through instructions
+## Quickstart
 
-The quickest end-to-end workflow is: compile source to IR, inspect the IR, run the module, then materialize a frame and step it instruction by instruction.
+Subclass `BaseFrame` and override the `dispatch_*` methods you need.
+Unhandled instructions will raise `NotImplementedError`.
+`BaseFrame` provides block navigation, name resolution, and a dispatch loop.
 
-To run a module, wrap its IR in a `Function`, create a frame with `make_frame`, and dispatch instructions in a loop. For instruction-level stepping, use `get_current_instruction()` and `dispatch_current_instruction()` directly.
+**Name resolution methods:**
+
+- `load_name(self, scope: Scope, name: str) -> Any`
+- `store_name(self, scope: Scope, name: str, value: Any) -> None`
+- `delete_name(self, scope: Scope, name: str) -> None`
+- `has_name(self, name: str) -> Optional[Scope]`
+- `load_builtin(self, name: str) -> Any`
 
 ```python
-import sys
-
 from pyssa.compiler import compile_source, new_compiler_state
 from pyssa.ir import print_region_ir
-from pyssa.interpreter import Function, Interpreter
+from pyssa.interpreter import BaseFrame, make_frame, NextInstructionEvent, ReturnEvent
 
-source = '''
-def make_adder(n=0):
-    def adder(x, y=1):
-        return x + y + n
-    return adder
 
-f = make_adder(10)
-result = f(5)
-'''
+# 1 ── compile Python source into a pyssa IR region ────────────────────────
 
-# 1. Compile Python source to IR
-module_ir = compile_source(new_compiler_state(), source, path='<example>')
+source = "result = x + y"
+module_ir = compile_source(new_compiler_state(), source, path="<tiny-add>")
 
-# 2. Inspect the IR
+# Inspect the bytecode-like IR before execution.
 print_region_ir(module_ir)
-
-# 3. Run the module normally
-module_fn = Function(region_ir=module_ir, globals_dict={})
-interp = Interpreter(search_path=list(sys.path))
-module_frame = interp.make_frame(module_fn, (), {})
-while not module_frame.finished:
-    module_event = module_frame.dispatch_current_instruction()
-    if module_event is not None:
-        break
-print(module_frame.locals["result"])   # 16
-
-# 4. Step through one call instruction by instruction
-f = module_frame.locals["f"]
-print(f.__defaults__)         # (1,)
-
-call_frame = interp.make_frame(f, (100,), {})
-while not call_frame.finished:
-    instr = call_frame.get_current_instruction()
-    print(f"L{call_frame.block_label.index}:{call_frame.instr_index}  {type(instr).__name__}")
-
-    call_event = call_frame.dispatch_current_instruction()
-    if call_event is not None:
-        print(f"returned: {call_event.value}")  # 111
-        break
-```
+#   region <module> entry=L0
+#     block L0:
+#       t0 = LoadName(scope=<Scope.NAME: 'name'>, name='x')
+#       t1 = LoadName(scope=<Scope.NAME: 'name'>, name='y')
+#       t2 = BinaryOp(op='+', lhs=t0, rhs=t1)
+#       StoreName(src=t2, scope=<Scope.NAME: 'name'>, name='result')
+#       t3 = Const(value=None)
+#       Return(value=t3)
 
 
-## Building Custom Interpreters
-
-Choose the frame type when creating a frame:
-
-- `interp.make_frame(..., frame_class=MyFrame)`
-
-A simple way to customize execution is to subclass the concrete `Frame`, intercept each instruction, and then delegate to the normal implementation. You can still execute the resulting frame step by step:
-
-```python
-import sys
-
-from pyssa.compiler import compile_source, new_compiler_state
-from pyssa.interpreter import Frame, Function, Interpreter
-
-class TracingFrame(Frame):
-    def dispatch_current_instruction(self):
-        instr = self.get_current_instruction()
-        if instr is not None:
-            print(f"before  L{self.block_label.index}:{self.instr_index}  {type(instr).__name__}")
-        event = super().dispatch_current_instruction()
-        if event is not None:
-            print(f"event   {type(event).__name__}({event.value!r})")
-        return event
-
-source = '''
-def square(x):
-    return x * x
-'''
-
-module_ir = compile_source(new_compiler_state(), source, path='<trace>')
-module_fn = Function(region_ir=module_ir, globals_dict={})
-interp = Interpreter(search_path=list(sys.path))
-trace_frame = interp.make_frame(module_fn, (), {}, frame_class=TracingFrame)
-while not trace_frame.finished:
-    trace_event = trace_frame.dispatch_current_instruction()
-    if trace_event is not None:
-        break
-
-# For manual stepping, request the same frame class explicitly.
-step_frame = interp.make_frame(trace_frame.locals["square"], (7,), {}, frame_class=TracingFrame)
-while not step_frame.finished:
-    step_event = step_frame.dispatch_current_instruction()
-    if step_event is not None:
-        print(step_event.value)  # 49
-        break
-```
-
-If you want to define instruction semantics from scratch, subclass `BaseFrame`. It provides:
-
-- **Fields**: `interpreter`, `function`, `locals`, `globals`, `block_label`, `instr_index`, `cells`, `try_stack`, `finished`, `return_value`, `current_exception`
-- **Name resolution**: `load_name`, `store_name`, `delete_name`, `has_name`, `load_builtin`
-- **Exception handling**: `handle_exception`
-- **Block navigation**: `get_block`, `fallthrough_label`, `get_current_instruction`
-- **Dispatch loop**: `dispatch_current_instruction`
-- **Instruction stubs**: all `dispatch_*` methods raise `NotImplementedError`
-
-Supply additional state in your `__init__` and implement only the handlers you need. Using `make_frame` directly with a `Function` wrapping the module IR allows symbolically executing only portions of modules:
-
-```python
-from pyssa.compiler import compile_source, new_compiler_state
-from pyssa.interpreter import BaseFrame, Function, Interpreter, ReturnEvent
+# 2 ── define a custom interpreter frame ───────────────────────────────────
 
 class TinyAddOnlyFrame(BaseFrame):
-    """Enough for a tiny add-only subset."""
+    """A custom interpreter that only understands addition."""
 
-    def __init__(self, interpreter, function, globals, locals, cells, block_label=None, instr_index=0):
-        super().__init__(interpreter, function, locals, globals, block_label, instr_index, cells)
-        self.temps = {}
+    def __init__(self, region_ir, globals, locals, cells,
+                 block_label, instr_index, finished, return_value):
+        super().__init__(region_ir, globals, locals, cells,
+                         block_label=block_label, instr_index=instr_index,
+                         finished=finished, return_value=return_value)
+        self.temps = {}    # map temporaries to values
 
     def dispatch_const(self, instr):
         self.temps[instr.dst] = instr.value
+        return NextInstructionEvent()
 
     def dispatch_load_name(self, instr):
         self.temps[instr.dst] = self.load_name(instr.scope, instr.name)
+        return NextInstructionEvent()
 
     def dispatch_store_name(self, instr):
         self.store_name(instr.scope, instr.name, self.temps[instr.src])
+        return NextInstructionEvent()
 
     def dispatch_binary_op(self, instr):
         if instr.op != "+":
-            raise NotImplementedError("TinyAddOnlyFrame only supports addition")
-        self.temps[instr.dst] = self.temps[instr.lhs] + self.temps[instr.rhs]
+            raise NotImplementedError(
+                "TinyAddOnlyFrame only supports addition"
+            )
+        self.temps[instr.dst] = \
+            self.temps[instr.lhs] + self.temps[instr.rhs]
+        return NextInstructionEvent()
 
     def dispatch_return(self, instr):
         return ReturnEvent(self.temps[instr.value])
 
-source = "result = x + y"
-module_ir = compile_source(new_compiler_state(), source, path="<tiny-add>")
-module_function = Function(region_ir=module_ir, globals_dict={"x": 2, "y": 3})
-interp = Interpreter()
-add_frame = interp.make_frame(module_function, (), {}, frame_class=TinyAddOnlyFrame)
+
+# 3 ── create a frame from the IR region and step through instructions ─────
+
+add_frame = make_frame(
+    TinyAddOnlyFrame,
+    module_ir,
+    globals={"x": 2, "y": 3},
+)
+
 while not add_frame.finished:
-    add_event = add_frame.dispatch_current_instruction()
-    if add_event is not None:
-        break
-print(add_frame.locals["result"])  # 5
+    instr = add_frame.get_current_instruction()
+    print(f"  [{type(instr).__name__}]")
+
+    event = add_frame.dispatch_current_instruction()
+    if isinstance(event, ReturnEvent):
+        break   # frame is done
+
+print(add_frame.locals["result"])     # 5
 ```
 
 ## IR overview
