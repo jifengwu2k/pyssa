@@ -7,8 +7,8 @@ containers (BasicBlock, Region), and the rendering helpers for
 debugging and visualization.
 """
 
-from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from enum import Enum, IntFlag
+from typing import Any, Optional, Sequence, Tuple
 
 import attrs
 from cowlist import COWList
@@ -25,6 +25,94 @@ class Scope(str, Enum):
     GLOBAL = "global"
     NAME = "name"
     CELL = "cell"
+
+
+class SyntheticLocalPurpose(str, Enum):
+    """Purposes assigned to compiler-generated local variables."""
+
+    GENERAL = ""
+    FOR_ITER = "for_iter"
+    ASYNC_FOR_ITER = "async_for_iter"
+    IFEXP_RESULT = "ifexp_result"
+    BOOL_OP_RESULT = "boolop_result"
+    COMPREHENSION_ITER = "comprehension_iter"
+    SAVED_PRESENT = "saved_present"
+    SAVED_VALUE = "saved_value"
+    COMPARE_CURRENT = "compare_current"
+    COMPARE_RESULT = "compare_result"
+
+
+class UnaryOperator(str, Enum):
+    """Unary operators supported by the IR."""
+
+    POSITIVE = "+"
+    NEGATIVE = "-"
+    NOT = "not"
+    INVERT = "~"
+
+
+class BinaryOperator(str, Enum):
+    """Binary operators supported by the IR."""
+
+    ADD = "+"
+    SUBTRACT = "-"
+    MULTIPLY = "*"
+    TRUE_DIVIDE = "/"
+    FLOOR_DIVIDE = "//"
+    MODULO = "%"
+    POWER = "**"
+    LEFT_SHIFT = "<<"
+    RIGHT_SHIFT = ">>"
+    BITWISE_AND = "&"
+    BITWISE_OR = "|"
+    BITWISE_XOR = "^"
+    MATRIX_MULTIPLY = "@"
+
+
+class ComparisonOperator(str, Enum):
+    """Comparison operators supported by the IR."""
+
+    LESS_THAN = "<"
+    LESS_THAN_OR_EQUAL = "<="
+    EQUAL = "=="
+    NOT_EQUAL = "!="
+    GREATER_THAN = ">"
+    GREATER_THAN_OR_EQUAL = ">="
+    IS = "is"
+    IS_NOT = "is not"
+    IN = "in"
+    NOT_IN = "not in"
+
+
+class FormatConversion(str, Enum):
+    """Conversions accepted by formatted-value instructions."""
+
+    STR = "str"
+    REPR = "repr"
+    ASCII = "ascii"
+
+
+class CodeFlag(IntFlag):
+    """Flags carried by Python code objects and function regions."""
+
+    OPTIMIZED = 0x0001
+    NEW_LOCALS = 0x0002
+    VAR_ARGS = 0x0004
+    VAR_KEYWORDS = 0x0008
+    NESTED = 0x0010
+    GENERATOR = 0x0020
+    NO_FREE = 0x0040
+    COROUTINE = 0x0080
+    ITERABLE_COROUTINE = 0x0100
+    ASYNC_GENERATOR = 0x0200
+    FUTURE_DIVISION = 0x020000
+    FUTURE_ABSOLUTE_IMPORT = 0x040000
+    FUTURE_WITH_STATEMENT = 0x080000
+    FUTURE_PRINT_FUNCTION = 0x100000
+    FUTURE_UNICODE_LITERALS = 0x200000
+    FUTURE_BARRY_AS_BDFL = 0x400000
+    FUTURE_GENERATOR_STOP = 0x800000
+    FUTURE_ANNOTATIONS = 0x1000000
 
 
 @attrs.define(frozen=True)
@@ -60,7 +148,9 @@ class SyntheticLocal(Operand):
     """Compiler-generated local variable (not user-visible)."""
 
     index: int
-    purpose: str = ""
+    purpose: SyntheticLocalPurpose = attrs.field(
+        default=SyntheticLocalPurpose.GENERAL, converter=SyntheticLocalPurpose
+    )
 
 
 @attrs.define(frozen=True)
@@ -127,7 +217,7 @@ class Const(ValueInstruction):
 class LoadName(ValueInstruction):
     """Load a named variable from a scope."""
 
-    scope: Scope = Scope.LOCAL
+    scope: Scope = attrs.field(default=Scope.LOCAL, converter=Scope)
     name: str = ""
 
 
@@ -136,7 +226,7 @@ class StoreName(EffectInstruction):
     """Store a value into a named variable."""
 
     src: TemporaryValue
-    scope: Scope = Scope.LOCAL
+    scope: Scope = attrs.field(default=Scope.LOCAL, converter=Scope)
     name: str = ""
 
 
@@ -144,8 +234,22 @@ class StoreName(EffectInstruction):
 class DeleteName(EffectInstruction):
     """Delete a named variable."""
 
-    scope: Scope = Scope.LOCAL
+    scope: Scope = attrs.field(default=Scope.LOCAL, converter=Scope)
     name: str = ""
+
+
+@attrs.define(frozen=True)
+class Annotate(EffectInstruction):
+    """Associate a type annotation with a target.
+
+    Both operands are nested expression regions (referenced via
+    ``child_regions``, like lambda bodies): ordinary IR ending in ``Return``,
+    lowered but held here rather than emitted into the enclosing block, so they
+    are executed only if an interpreter chooses to evaluate them.
+    """
+
+    obj: RegionLabel
+    annotation: RegionLabel
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +261,7 @@ class DeleteName(EffectInstruction):
 class UnaryOp(ValueInstruction):
     """Apply a unary operator."""
 
-    op: str
+    op: UnaryOperator = attrs.field(converter=UnaryOperator)
     src: TemporaryValue
 
 
@@ -165,7 +269,7 @@ class UnaryOp(ValueInstruction):
 class BinaryOp(ValueInstruction):
     """Apply a binary operator."""
 
-    op: str
+    op: BinaryOperator = attrs.field(converter=BinaryOperator)
     lhs: TemporaryValue
     rhs: TemporaryValue
 
@@ -174,7 +278,7 @@ class BinaryOp(ValueInstruction):
 class CompareOp(ValueInstruction):
     """Apply a comparison operator."""
 
-    cmp: str
+    cmp: ComparisonOperator = attrs.field(converter=ComparisonOperator)
     lhs: TemporaryValue
     rhs: TemporaryValue
 
@@ -238,30 +342,28 @@ class DeleteItem(EffectInstruction):
 class BuildTuple(ValueInstruction):
     """Build a tuple from operands."""
 
-    items: Sequence[Operand] = attrs.field(factory=COWList)
+    items: Sequence[Operand] = COWList()
 
 
 @attrs.define(frozen=True)
 class BuildList(ValueInstruction):
     """Build a list from operands."""
 
-    items: Sequence[Operand] = attrs.field(factory=COWList)
+    items: Sequence[Operand] = COWList()
 
 
 @attrs.define(frozen=True)
 class BuildSet(ValueInstruction):
     """Build a set from operands."""
 
-    items: Sequence[Operand] = attrs.field(factory=COWList)
+    items: Sequence[Operand] = COWList()
 
 
 @attrs.define(frozen=True)
 class BuildMap(ValueInstruction):
     """Build a dict from key-value pairs.  ``None`` keys indicate unpacked mappings."""
 
-    items: Sequence[Tuple[Optional[TemporaryValue], TemporaryValue]] = attrs.field(
-        factory=COWList
-    )
+    items: Sequence[Tuple[Optional[TemporaryValue], TemporaryValue]] = COWList()
 
 
 @attrs.define(frozen=True)
@@ -277,7 +379,7 @@ class BuildSlice(ValueInstruction):
 class BuildString(ValueInstruction):
     """Build a string from parts (f-string concatenation)."""
 
-    parts: Sequence[TemporaryValue] = attrs.field(factory=COWList)
+    parts: Sequence[TemporaryValue] = COWList()
 
 
 @attrs.define(frozen=True)
@@ -285,7 +387,9 @@ class FormatValue(ValueInstruction):
     """Format a single value for an f-string."""
 
     value: TemporaryValue
-    conversion: Optional[str] = None
+    conversion: Optional[FormatConversion] = attrs.field(
+        default=None, converter=attrs.converters.optional(FormatConversion)
+    )
     spec: Optional[TemporaryValue] = None
 
 
@@ -294,7 +398,7 @@ class Unpack(EffectInstruction):
     """Unpack an iterable into multiple destinations (with optional star)."""
 
     src: TemporaryValue
-    dsts: Sequence[TemporaryValue] = attrs.field(factory=COWList)
+    dsts: Sequence[TemporaryValue] = COWList()
     star_index: Optional[int] = None
 
 
@@ -308,11 +412,8 @@ class Call(ValueInstruction):
     """Call a function or other callable."""
 
     callee: TemporaryValue
-    args: Sequence[Operand] = attrs.field(factory=COWList)
-    kwargs: Sequence[Tuple[Optional[str], TemporaryValue]] = attrs.field(
-        factory=COWList
-    )
-    flags: int = 0
+    args: Sequence[Operand] = COWList()
+    kwargs: Sequence[Tuple[Optional[str], TemporaryValue]] = COWList()
 
 
 @attrs.define(frozen=True)
@@ -320,7 +421,7 @@ class ImportName(ValueInstruction):
     """Import a module by name."""
 
     module: Optional[str]
-    fromlist: Sequence[str] = attrs.field(factory=COWList)
+    fromlist: Sequence[str] = COWList()
     level: int = 0
 
 
@@ -339,16 +440,43 @@ class ImportStar(EffectInstruction):
     module_obj: TemporaryValue
 
 
+class TypeParamKind(str, Enum):
+    """Kinds of PEP 695 type parameters."""
+
+    TYPE_VAR = "TypeVar"
+    PARAM_SPEC = "ParamSpec"
+    TYPE_VAR_TUPLE = "TypeVarTuple"
+
+
+@attrs.define(frozen=True)
+class TypeParam:
+    """A PEP 695 type parameter for a generic class, function, or alias.
+
+    ``bound`` and ``default`` are nested expression regions (lazy, like
+    annotations) when present, and ``None`` otherwise.
+    """
+
+    name: str
+    kind: TypeParamKind = attrs.field(
+        default=TypeParamKind.TYPE_VAR, converter=TypeParamKind
+    )
+    bound: Optional[RegionLabel] = None
+    default: Optional[RegionLabel] = None
+
+
 @attrs.define(frozen=True)
 class MakeFunction(ValueInstruction):
     """Create a function object from a child region."""
 
     code: RegionLabel
-    defaults: Sequence[TemporaryValue] = attrs.field(factory=COWList)
-    kwdefaults: Sequence[Tuple[str, TemporaryValue]] = attrs.field(factory=COWList)
-    annotations: Sequence[Tuple[str, TemporaryValue]] = attrs.field(factory=COWList)
-    closure: Sequence[TemporaryValue] = attrs.field(factory=COWList)
-    flags: int = 0
+    defaults: Sequence[TemporaryValue] = COWList()
+    kwdefaults: Sequence[Tuple[str, TemporaryValue]] = COWList()
+    # Each annotation is a nested expression region (like Annotate's operands),
+    # so signatures are lazy and never evaluated during region execution.
+    annotations: Sequence[Tuple[str, RegionLabel]] = COWList()
+    closure: Sequence[TemporaryValue] = COWList()
+    type_params: Sequence[TypeParam] = COWList()
+    flags: CodeFlag = attrs.field(default=CodeFlag(0), converter=CodeFlag)
 
 
 @attrs.define(frozen=True)
@@ -357,8 +485,23 @@ class BuildClass(ValueInstruction):
 
     body_func: TemporaryValue
     name: TemporaryValue
-    bases: Sequence[TemporaryValue] = attrs.field(factory=COWList)
-    keywords: Sequence[Tuple[str, TemporaryValue]] = attrs.field(factory=COWList)
+    bases: Sequence[TemporaryValue] = COWList()
+    keywords: Sequence[Tuple[str, TemporaryValue]] = COWList()
+    type_params: Sequence[TypeParam] = COWList()
+
+
+@attrs.define(frozen=True)
+class MakeTypeAlias(ValueInstruction):
+    """Create a PEP 695 type alias (``type X = ...``).
+
+    The alias value is a nested expression region, matching PEP 695's lazy
+    evaluation of alias values.  The bound name is set separately via
+    ``StoreName``.
+    """
+
+    name: str
+    value: RegionLabel
+    type_params: Sequence[TypeParam] = COWList()
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +545,6 @@ class GetAwaitable(ValueInstruction):
     """Wrap a value as an awaitable."""
 
     value: TemporaryValue
-    where: int = 0
 
 
 @attrs.define(frozen=True)
@@ -561,7 +703,7 @@ class MatchClass(ValueInstruction):
 
     value: TemporaryValue
     cls: TemporaryValue
-    attr_names: Sequence[str] = attrs.field(factory=COWList)
+    attr_names: Sequence[str] = COWList()
     positional_count: int = 0
 
 
@@ -575,19 +717,7 @@ class BasicBlock:
     """A straight-line sequence of instructions with a label."""
 
     label: BasicBlockLabel
-    instructions: Sequence[Instruction] = attrs.field(factory=COWList)
-
-
-@attrs.define(frozen=True)
-class ExceptionHandler:
-    """Metadata describing an exception handler range."""
-
-    start_label: BasicBlockLabel
-    end_label: BasicBlockLabel
-    target_label: BasicBlockLabel
-    stack_depth: Optional[int] = None
-    push_lasti: bool = False
-    pop_on_entry: int = 0
+    instructions: Sequence[Instruction] = COWList()
 
 
 @attrs.define(frozen=True)
@@ -598,18 +728,16 @@ class Region:
     entry_label: BasicBlockLabel
     label: Optional[RegionLabel] = None
     is_class: bool = False
-    basic_blocks: Sequence[BasicBlock] = attrs.field(factory=COWList)
-    child_regions: Sequence["Region"] = attrs.field(factory=COWList)
-    locals: Sequence[str] = attrs.field(factory=COWList)
-    cells: Sequence[str] = attrs.field(factory=COWList)
-    freevars: Sequence[str] = attrs.field(factory=COWList)
-    handlers: Sequence[ExceptionHandler] = attrs.field(factory=COWList)
+    basic_blocks: Sequence[BasicBlock] = COWList()
+    child_regions: Sequence["Region"] = COWList()
+    locals: Sequence[str] = COWList()
+    cells: Sequence[str] = COWList()
+    freevars: Sequence[str] = COWList()
     argcount: int = 0
     posonlyargcount: int = 0
     kwonlyargcount: int = 0
     vararg_name: Optional[str] = None
     kwarg_name: Optional[str] = None
-    flags: int = 0
 
 
 # ===========================================================================
@@ -630,7 +758,7 @@ def format_value(value: Any) -> str:
     if isinstance(value, RegionLabel):
         return "R%s" % (value.index,)
     if isinstance(value, SyntheticLocal):
-        suffix = "" if not value.purpose else ":%s" % (value.purpose,)
+        suffix = "" if not value.purpose.value else ":%s" % (value.purpose.value,)
         return "s%s%s" % (value.index, suffix)
     if isinstance(value, Region):
         return "@%s" % (value.name,)
@@ -648,7 +776,7 @@ def render_payload(value: Any) -> str:
     if isinstance(value, RegionLabel):
         return "R%s" % (value.index,)
     if isinstance(value, SyntheticLocal):
-        suffix = "" if not value.purpose else ":%s" % (value.purpose,)
+        suffix = "" if not value.purpose.value else ":%s" % (value.purpose.value,)
         return "s%s%s" % (value.index, suffix)
     if isinstance(value, Region):
         return "@%s" % (value.name,)

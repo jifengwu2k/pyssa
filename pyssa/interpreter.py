@@ -2,11 +2,8 @@ import builtins
 from typing import (
     Any,
     Dict,
-    List,
-    Mapping,
+    MutableMapping,
     Optional,
-    Sequence,
-    Tuple,
     Type,
 )
 
@@ -32,6 +29,7 @@ from pyssa.ir import (
     CompareOp,
     Const,
     CurrentException,
+    Annotate,
     DeleteAttr,
     DeleteItem,
     DeleteName,
@@ -52,6 +50,7 @@ from pyssa.ir import (
     LoadItem,
     LoadName,
     MakeFunction,
+    MakeTypeAlias,
     MatchClass,
     MatchKeys,
     MatchMapping,
@@ -60,30 +59,29 @@ from pyssa.ir import (
     PushTry,
     Raise,
     Region,
-    RegionLabel,
     Reraise,
     Return,
     Scope,
     StoreAttr,
     StoreItem,
     StoreName,
-    TemporaryValue,
     UnaryOp,
     Unpack,
-    UnpackedTemporaryValue,
     YieldFrom,
     YieldValue,
 )
-from pyssa.compiler import new_compiler_state
 
-_UNSET = object()
+UNSET = object()
 
 
-@attrs.define
 class Cell:
-    """Mutable box used to model Python closure cells."""
+    """Mutable box used to model Python closure cells.
 
-    value: Any = _UNSET
+    Mutable by design, so a plain class rather than a frozen ``attrs`` type.
+    """
+
+    def __init__(self, value: Any = UNSET) -> None:
+        self.value = value
 
 
 class BaseEvent:
@@ -142,8 +140,8 @@ class BaseFrame:
     def __init__(
         self,
         region_ir: Region,
-        globals: Mapping[str, Any],
-        locals: Mapping[str, Any],
+        globals: MutableMapping[str, Any],
+        locals: MutableMapping[str, Any],
         cells: Dict[str, Cell],
         block_label: BasicBlockLabel,
         instr_index: int,
@@ -167,11 +165,11 @@ class BaseFrame:
         if scope == Scope.LOCAL:
             if name in self.locals:
                 return self.locals[name]
-            if name in self.cells and self.cells[name].value is not _UNSET:
+            if name in self.cells and self.cells[name].value is not UNSET:
                 return self.cells[name].value
             raise NameError(name)
         if scope == Scope.CELL:
-            if name in self.cells and self.cells[name].value is not _UNSET:
+            if name in self.cells and self.cells[name].value is not UNSET:
                 return self.cells[name].value
             raise NameError(name)
         if scope == Scope.GLOBAL:
@@ -202,7 +200,7 @@ class BaseFrame:
             return
         if scope == Scope.CELL:
             if name in self.cells:
-                self.cells[name].value = _UNSET
+                self.cells[name].value = UNSET
                 return
             raise NameError(name)
         del self.locals[name]
@@ -210,7 +208,7 @@ class BaseFrame:
     def has_name(self, name: str) -> Optional[Scope]:
         if name in self.locals:
             return Scope.LOCAL
-        if name in self.cells and self.cells[name].value is not _UNSET:
+        if name in self.cells and self.cells[name].value is not UNSET:
             return Scope.CELL
         if name in self.globals:
             return Scope.GLOBAL
@@ -241,6 +239,12 @@ class BaseFrame:
 
     def dispatch_delete_name(self, instr: DeleteName) -> BaseEvent:
         raise NotImplementedError
+
+    def dispatch_annotate(self, instr: Annotate) -> BaseEvent:
+        # Annotations carry no executable semantics here: the type and target
+        # live in nested regions that are only evaluated on demand.  A frame
+        # that cares about annotations can override this.
+        return NextInstructionEvent()
 
     def dispatch_unary_op(self, instr: UnaryOp) -> BaseEvent:
         raise NotImplementedError
@@ -306,6 +310,9 @@ class BaseFrame:
         raise NotImplementedError
 
     def dispatch_make_function(self, instr: MakeFunction) -> BaseEvent:
+        raise NotImplementedError
+
+    def dispatch_make_type_alias(self, instr: MakeTypeAlias) -> BaseEvent:
         raise NotImplementedError
 
     def dispatch_build_class(self, instr: BuildClass) -> BaseEvent:
@@ -400,17 +407,6 @@ class BaseFrame:
             "unknown block label %r in %s" % (label, self.region_ir.name)
         )
 
-    def fallthrough_label(
-        self, label: Optional[BasicBlockLabel] = None
-    ) -> Optional[BasicBlockLabel]:
-        if label is None:
-            label = self.block_label
-        basic_blocks = list(self.region_ir.basic_blocks)
-        for index, block in enumerate(basic_blocks):
-            if block.label == label and index + 1 < len(basic_blocks):
-                return basic_blocks[index + 1].label
-        return None
-
     def get_current_instruction(self) -> Optional[Instruction]:
         block = self.get_block()
         if self.instr_index < len(block.instructions):
@@ -428,13 +424,10 @@ class BaseFrame:
 
         block = self.get_block()
         if self.instr_index >= len(block.instructions):
-            next_label = self.fallthrough_label()
-            if next_label is None:
-                self.finished = True
-                return ReturnEvent(None)
-            self.block_label = next_label
-            self.instr_index = 0
-            block = self.get_block()
+            raise RuntimeError(
+                "block %s in %s has no terminator"
+                % (block.label, self.region_ir.name)
+            )
 
         instr = block.instructions[self.instr_index]
 
@@ -446,6 +439,8 @@ class BaseFrame:
             event = self.dispatch_store_name(instr)
         elif isinstance(instr, DeleteName):
             event = self.dispatch_delete_name(instr)
+        elif isinstance(instr, Annotate):
+            event = self.dispatch_annotate(instr)
         elif isinstance(instr, UnaryOp):
             event = self.dispatch_unary_op(instr)
         elif isinstance(instr, BinaryOp):
@@ -490,6 +485,8 @@ class BaseFrame:
             event = self.dispatch_import_star(instr)
         elif isinstance(instr, MakeFunction):
             event = self.dispatch_make_function(instr)
+        elif isinstance(instr, MakeTypeAlias):
+            event = self.dispatch_make_type_alias(instr)
         elif isinstance(instr, BuildClass):
             event = self.dispatch_build_class(instr)
         elif isinstance(instr, GetIter):
@@ -559,6 +556,7 @@ class BaseFrame:
             return event
         elif isinstance(event, ReturnEvent):
             self.finished = True
+            self.return_value = event.value
             return event
         else:
             raise RuntimeError("unknown execution event %r" % (event,))
@@ -572,21 +570,27 @@ class BaseFrame:
 def make_frame(
     frame_class: Type[BaseFrame],
     region_ir: Region,
-    globals: Mapping[str, Any],
-    locals: Optional[Mapping[str, Any]] = None,
+    globals: MutableMapping[str, Any],
+    locals: Optional[MutableMapping[str, Any]] = None,
     cells: Optional[Dict[str, Cell]] = None,
 ) -> BaseFrame:
     """Materialize a frame for one region invocation.
 
     When *locals* is not given, *globals* is used as the locals
-    namespace (module entry).  *cells* provides pre-seeded closure cells.
+    namespace (module entry).  *cells* provides pre-seeded closure cells;
+    callers must still supply populated cells for captured free variables,
+    but any missing cellvar/freevar gets an empty cell so the frame is
+    self-consistent.
     """
     if locals is None:
         locals = globals
     cells = dict(cells or {})
     for name in region_ir.cells:
         if name not in cells:
-            cells[name] = Cell(locals.get(name, _UNSET))
+            cells[name] = Cell(locals.get(name, UNSET))
+    for name in region_ir.freevars:
+        if name not in cells:
+            cells[name] = Cell()
     return frame_class(
         region_ir=region_ir,
         globals=globals,

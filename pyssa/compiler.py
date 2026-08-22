@@ -7,10 +7,10 @@ structured as explicit lowering functions with explicit parameters
 rather than a large class-based visitor.
 """
 
-import __future__
 import ast
 import builtins
 import symtable
+import sys
 import types
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -24,12 +24,19 @@ from .ir import (
     Scope,
     SourceSpan,
     SyntheticLocal,
+    SyntheticLocalPurpose,
     TemporaryValue,
+    UnaryOperator,
+    BinaryOperator,
+    ComparisonOperator,
+    FormatConversion,
+    CodeFlag,
     UnpackedTemporaryValue,
     Const,
     LoadName,
     StoreName,
     DeleteName,
+    Annotate,
     UnaryOp,
     BinaryOp,
     CompareOp,
@@ -53,6 +60,9 @@ from .ir import (
     ImportStar,
     MakeFunction,
     BuildClass,
+    MakeTypeAlias,
+    TypeParam,
+    TypeParamKind,
     GetIter,
     ForIter,
     GetAIter,
@@ -79,14 +89,43 @@ from .ir import (
     MatchKeys,
     MatchClass,
     BasicBlock,
-    ExceptionHandler,
     Region,
-    print_region_ir,
 )
 
 # ---------------------------------------------------------------------------
 # Error used when the frontend reaches syntax it still does not lower.
 # ---------------------------------------------------------------------------
+
+
+# ``ast.TypeAlias`` (PEP 695 `type X = ...`) only exists on Python 3.12+.
+if sys.version_info >= (3, 12):
+    TypeAliasNode = ast.TypeAlias
+    TypeVarNode = ast.TypeVar
+    ParamSpecNode = ast.ParamSpec
+    TypeVarTupleNode = ast.TypeVarTuple
+else:
+    TypeAliasNode = None
+    TypeVarNode = None
+    ParamSpecNode = None
+    TypeVarTupleNode = None
+
+# Assignment expressions arrived in 3.8, structural pattern matching in 3.10,
+# and ``except*`` in 3.11. Guard attribute access so this module still imports
+# and lowers older syntax on earlier interpreters.
+if sys.version_info >= (3, 8):
+    NamedExprNode = ast.NamedExpr
+else:
+    NamedExprNode = None
+
+if sys.version_info >= (3, 10):
+    MatchNode = ast.Match
+else:
+    MatchNode = None
+
+if sys.version_info >= (3, 11):
+    TryStarNode = ast.TryStar
+else:
+    TryStarNode = None
 
 
 class UnsupportedFeature(NotImplementedError):
@@ -108,26 +147,42 @@ class UnsupportedFeature(NotImplementedError):
 # ---------------------------------------------------------------------------
 
 
-@attrs.define
 class RegionContext:
     """Per-region state shared by lowering helpers.
 
     The ``code_obj`` comes from Python's own compiler and is used only for
     metadata / scope shape, not for bytecode lowering.
+
+    This is mutable lowering state, so it is a plain class with regular
+    containers rather than a frozen ``attrs`` type.
     """
 
-    name: str
-    name_path: COWList
-    is_class: bool
-    node: ast.AST
-    table: Any
-    code_obj: types.CodeType
-    builder: "BlockBuilder"
-    child_tables: List[Any] = attrs.field(factory=list)
-    child_codes: List[types.CodeType] = attrs.field(factory=list)
-    used_child_tables: Set[int] = attrs.field(factory=set)
-    used_child_codes: Set[int] = attrs.field(factory=set)
-    next_child_region_label: int = 0
+    def __init__(
+        self,
+        name: str,
+        name_path: COWList,
+        is_class: bool,
+        node: ast.AST,
+        table: Any,
+        code_obj: types.CodeType,
+        builder: "BlockBuilder",
+        child_tables: Optional[List[Any]] = None,
+        child_codes: Optional[List[types.CodeType]] = None,
+    ) -> None:
+        self.name = name
+        self.name_path = name_path
+        self.is_class = is_class
+        self.node = node
+        self.table = table
+        self.code_obj = code_obj
+        self.builder = builder
+        self.child_tables: List[Any] = [] if child_tables is None else child_tables
+        self.child_codes: List[types.CodeType] = (
+            [] if child_codes is None else child_codes
+        )
+        self.used_child_tables: Set[int] = set()
+        self.used_child_codes: Set[int] = set()
+        self.next_child_region_label: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -166,10 +221,6 @@ class BlockBuilder:
 
     def is_open(self) -> bool:
         return self.current_label is not None
-
-    def ensure_open(self) -> None:
-        if not self.is_open():
-            self.start_block(self.new_label())
 
     def emit(self, instr: Any) -> None:
         if not self.is_open():
@@ -218,10 +269,33 @@ class BlockBuilder:
 
 
 class ChildRegionType(str, Enum):
-    """Kinds of nested executable regions under a parent region."""
+    """Kinds of nested symbol-table regions used by the compiler."""
 
     FUNCTION = "function"
     CLASS = "class"
+    TYPE_PARAMETERS = "type parameters"
+
+
+class CleanupKind(str, Enum):
+    """Kinds of pending cleanup contexts (finally or with-exit)."""
+
+    TRY = "try"
+    WITH = "with"
+
+
+class EarlyExitKind(str, Enum):
+    """Kinds of early exits routed through pending cleanups."""
+
+    RETURN = "return"
+    BREAK = "break"
+    CONTINUE = "continue"
+
+
+class TryKind(str, Enum):
+    """Kinds of try statement lowered by the shared CFG builder."""
+
+    NORMAL = "try"
+    EXCEPTION_GROUP = "try*"
 
 
 # ---------------------------------------------------------------------------
@@ -229,17 +303,45 @@ class ChildRegionType(str, Enum):
 # ---------------------------------------------------------------------------
 
 
-@attrs.define
 class CompilerState:
-    """Cross-region compiler state.  Intentionally small and explicit."""
+    """Cross-region compiler state.  Intentionally small and explicit.
 
-    temp_index: int = 0
-    synthetic_local_index: int = 0
-    loop_stack: List[Tuple[BasicBlockLabel, BasicBlockLabel]] = attrs.field(
-        factory=list
-    )
-    region_nested_stacks: List[List[Region]] = attrs.field(factory=list)
-    synthetic_region_name_stacks: List[Dict[str, int]] = attrs.field(factory=list)
+    Mutable lowering state, so a plain class with regular lists rather than a
+    frozen ``attrs`` type.
+    """
+
+    def __init__(self) -> None:
+        self.temp_index: int = 0
+        self.synthetic_local_index: int = 0
+        self.loop_stack: List[Tuple[BasicBlockLabel, BasicBlockLabel]] = []
+        self.finally_stack: List["CleanupContext"] = []
+        self.region_nested_stacks: List[List[Region]] = []
+        self.synthetic_region_name_stacks: List[Dict[str, int]] = []
+
+
+class CleanupContext:
+    """Pending finally/exit cleanup used to route early returns and escapes.
+
+    Mutable lowering state, so a plain class with a regular list rather than a
+    frozen ``attrs`` type.
+    """
+
+    def __init__(
+        self,
+        kind: CleanupKind,
+        owner: ast.AST,
+        pop_count: int = 0,
+        finalbody: Sequence[ast.stmt] = (),
+        exit_fn: Optional[TemporaryValue] = None,
+        is_async: bool = False,
+    ) -> None:
+        self.kind = kind
+        self.owner = owner
+        self.pop_count = pop_count
+        self.exits: List[Tuple[BasicBlockLabel, EarlyExitKind, Any, int]] = []
+        self.finalbody = finalbody
+        self.exit_fn = exit_fn
+        self.is_async = is_async
 
 
 def new_compiler_state() -> CompilerState:
@@ -258,10 +360,25 @@ def fresh_child_region_label(ctx: RegionContext) -> RegionLabel:
     return label
 
 
-def fresh_synthetic_local(state: CompilerState, purpose: str = "") -> SyntheticLocal:
+def fresh_synthetic_local(
+    state: CompilerState,
+    purpose: SyntheticLocalPurpose = SyntheticLocalPurpose.GENERAL,
+) -> SyntheticLocal:
     local = SyntheticLocal(index=state.synthetic_local_index, purpose=purpose)
     state.synthetic_local_index += 1
     return local
+
+
+def synthetic_local_name(local: SyntheticLocal) -> str:
+    """Render a compiler synthetic local as a real ``str`` name operand.
+
+    Synthetic locals must not collide with user identifiers, so they use the
+    reserved ``<synthetic:...>`` prefix (Python identifiers cannot contain
+    ``<``).  The same object is always rendered to the same string, so the
+    store/load/delete pairs still agree while satisfying the ``name: str``
+    contract on name instructions.
+    """
+    return "<synthetic:%s:%d>" % (local.purpose.value, local.index)
 
 
 def compile_source(state: CompilerState, source: str, path: str = "<ast>") -> Region:
@@ -291,6 +408,36 @@ def child_code_objects(
     state: CompilerState, code_obj: types.CodeType
 ) -> List[types.CodeType]:
     return [const for const in code_obj.co_consts if isinstance(const, types.CodeType)]
+
+
+def finish_region(
+    builder: BlockBuilder,
+    name: str,
+    label: Optional[RegionLabel],
+    is_class: bool,
+    code_obj: types.CodeType,
+    nested_regions: List[Region],
+    vararg_name: Optional[str] = None,
+    kwarg_name: Optional[str] = None,
+) -> Region:
+    """Materialize a finished region from its builder and code metadata."""
+    basic_blocks = builder.finish()
+    return Region(
+        name=name,
+        entry_label=basic_blocks[0].label,
+        label=label,
+        is_class=is_class,
+        basic_blocks=basic_blocks,
+        child_regions=COWList(nested_regions),
+        locals=COWList(code_obj.co_varnames),
+        cells=COWList(code_obj.co_cellvars),
+        freevars=COWList(code_obj.co_freevars),
+        argcount=code_obj.co_argcount,
+        posonlyargcount=getattr(code_obj, "co_posonlyargcount", 0),
+        kwonlyargcount=code_obj.co_kwonlyargcount,
+        vararg_name=vararg_name,
+        kwarg_name=kwarg_name,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +507,9 @@ def compile_region_ast(
     builder = BlockBuilder()
     builder.start()
     previous_loop_stack = state.loop_stack
+    previous_finally_stack = state.finally_stack
     state.loop_stack = []
+    state.finally_stack = []
     state.region_nested_stacks.append([])
     state.synthetic_region_name_stacks.append({})
     ctx = RegionContext(
@@ -385,26 +534,12 @@ def compile_region_ast(
     nested_regions.extend(state.region_nested_stacks.pop())
     state.synthetic_region_name_stacks.pop()
     vararg_name, kwarg_name = region_variadic_names(node)
-    basic_blocks = builder.finish()
-    region = Region(
-        name=name,
-        entry_label=basic_blocks[0].label,
-        label=label,
-        is_class=is_class,
-        basic_blocks=basic_blocks,
-        child_regions=COWList(nested_regions),
-        locals=COWList(code_obj.co_varnames),
-        cells=COWList(code_obj.co_cellvars),
-        freevars=COWList(code_obj.co_freevars),
-        argcount=code_obj.co_argcount,
-        posonlyargcount=getattr(code_obj, "co_posonlyargcount", 0),
-        kwonlyargcount=code_obj.co_kwonlyargcount,
-        vararg_name=vararg_name,
-        kwarg_name=kwarg_name,
-        flags=code_obj.co_flags,
-    )
     state.loop_stack = previous_loop_stack
-    return region
+    state.finally_stack = previous_finally_stack
+    return finish_region(
+        builder, name, label, is_class, code_obj, nested_regions,
+        vararg_name, kwarg_name,
+    )
 
 
 def compile_genexpr_region(
@@ -421,7 +556,9 @@ def compile_genexpr_region(
     builder = BlockBuilder()
     builder.start()
     previous_loop_stack = state.loop_stack
+    previous_finally_stack = state.finally_stack
     state.loop_stack = []
+    state.finally_stack = []
     state.region_nested_stacks.append([])
     state.synthetic_region_name_stacks.append({})
     ctx = RegionContext(
@@ -451,24 +588,9 @@ def compile_genexpr_region(
         builder.finish_block()
     nested_regions = state.region_nested_stacks.pop()
     state.synthetic_region_name_stacks.pop()
-    basic_blocks = builder.finish()
-    region = Region(
-        name=name,
-        entry_label=basic_blocks[0].label,
-        label=label,
-        is_class=is_class,
-        basic_blocks=basic_blocks,
-        child_regions=COWList(nested_regions),
-        locals=COWList(code_obj.co_varnames),
-        cells=COWList(code_obj.co_cellvars),
-        freevars=COWList(code_obj.co_freevars),
-        argcount=code_obj.co_argcount,
-        posonlyargcount=getattr(code_obj, "co_posonlyargcount", 0),
-        kwonlyargcount=code_obj.co_kwonlyargcount,
-        flags=code_obj.co_flags,
-    )
     state.loop_stack = previous_loop_stack
-    return region
+    state.finally_stack = previous_finally_stack
+    return finish_region(builder, name, label, is_class, code_obj, nested_regions)
 
 
 def compile_lambda_region(
@@ -485,7 +607,9 @@ def compile_lambda_region(
     builder = BlockBuilder()
     builder.start()
     previous_loop_stack = state.loop_stack
+    previous_finally_stack = state.finally_stack
     state.loop_stack = []
+    state.finally_stack = []
     state.region_nested_stacks.append([])
     state.synthetic_region_name_stacks.append({})
     ctx = RegionContext(
@@ -505,26 +629,12 @@ def compile_lambda_region(
     nested_regions = state.region_nested_stacks.pop()
     state.synthetic_region_name_stacks.pop()
     vararg_name, kwarg_name = region_variadic_names(node)
-    basic_blocks = builder.finish()
-    region = Region(
-        name=name,
-        entry_label=basic_blocks[0].label,
-        label=label,
-        is_class=is_class,
-        basic_blocks=basic_blocks,
-        child_regions=COWList(nested_regions),
-        locals=COWList(code_obj.co_varnames),
-        cells=COWList(code_obj.co_cellvars),
-        freevars=COWList(code_obj.co_freevars),
-        argcount=code_obj.co_argcount,
-        posonlyargcount=getattr(code_obj, "co_posonlyargcount", 0),
-        kwonlyargcount=code_obj.co_kwonlyargcount,
-        vararg_name=vararg_name,
-        kwarg_name=kwarg_name,
-        flags=code_obj.co_flags,
-    )
     state.loop_stack = previous_loop_stack
-    return region
+    state.finally_stack = previous_finally_stack
+    return finish_region(
+        builder, name, label, is_class, code_obj, nested_regions,
+        vararg_name, kwarg_name,
+    )
 
 
 def emit_genexpr_yield(
@@ -676,17 +786,58 @@ def lower_stmt(
             assign_target(state, ctx, target, value)
         return []
     if isinstance(stmt, ast.AnnAssign):
-        if stmt.value is None:
-            return []
-        value = lower_expr(state, ctx, stmt.value)
-        assign_target(state, ctx, stmt.target, value)
-        return []
+        if stmt.value is not None:
+            value = lower_expr(state, ctx, stmt.value)
+            assign_target(state, ctx, stmt.target, value)
+        obj_label, obj_region = lower_expression_region(
+            state, ctx, stmt.target, "<annotation-target>"
+        )
+        ann_label, ann_region = lower_expression_region(
+            state, ctx, stmt.annotation, "<annotation>"
+        )
+        ctx.builder.emit(
+            attach_meta(
+                state, Annotate(obj=obj_label, annotation=ann_label), stmt
+            )
+        )
+        return [obj_region, ann_region]
+    if TypeAliasNode is not None and isinstance(stmt, TypeAliasNode):
+        # PEP 695 `type X = ...`: the alias value is lazy, so it goes in its own
+        # nested region; the alias object is built and bound by name.
+        if not isinstance(stmt.name, ast.Name):
+            raise UnsupportedFeature(stmt, "type alias target is not a name")
+        value_label, value_region = lower_expression_region(
+            state, ctx, stmt.value, "<type-alias-value>"
+        )
+        type_params, type_param_regions = lower_type_params(state, ctx, stmt)
+        alias_temp = fresh_temp(state)
+        ctx.builder.emit(
+            attach_meta(
+                state,
+                MakeTypeAlias(
+                    dst=alias_temp,
+                    name=stmt.name.id,
+                    value=value_label,
+                    type_params=COWList(type_params),
+                ),
+                stmt,
+            )
+        )
+        scope = scope_for_store(state, ctx, stmt.name.id)
+        ctx.builder.emit(
+            attach_meta(
+                state,
+                StoreName(src=alias_temp, scope=scope, name=stmt.name.id),
+                stmt,
+            )
+        )
+        return [value_region] + type_param_regions
     if isinstance(stmt, ast.AugAssign):
         lower_augassign(state, ctx, stmt)
         return []
     if isinstance(stmt, ast.Return):
         value = lower_optional_expr(state, ctx, stmt.value, stmt)
-        ctx.builder.terminate(attach_meta(state, Return(value=value), stmt))
+        emit_exit(state, ctx, EarlyExitKind.RETURN, value, stmt)
         return []
     if isinstance(stmt, ast.Expr):
         lower_expr(state, ctx, stmt.value)
@@ -703,7 +854,7 @@ def lower_stmt(
         return lower_with(state, ctx, stmt)
     if isinstance(stmt, ast.AsyncWith):
         return lower_async_with(state, ctx, stmt)
-    if isinstance(stmt, ast.TryStar):
+    if TryStarNode is not None and isinstance(stmt, TryStarNode):
         return lower_try_star(state, ctx, stmt)
     if isinstance(stmt, ast.Try):
         return lower_try(state, ctx, stmt)
@@ -740,23 +891,58 @@ def lower_stmt(
         for target in stmt.targets:
             delete_target(state, ctx, target)
         return []
-    if isinstance(stmt, ast.Match):
+    if MatchNode is not None and isinstance(stmt, MatchNode):
         return lower_match(state, ctx, stmt)
     raise UnsupportedFeature(
         stmt, "statement %s is not implemented in AST lowering" % type(stmt).__name__
     )
 
 
-def future_annotations_enabled(code_obj: types.CodeType) -> bool:
-    return bool(code_obj.co_flags & __future__.annotations.compiler_flag)
+def lower_expression_region(
+    state: CompilerState, ctx: RegionContext, expr: ast.AST, name: str
+) -> Tuple[RegionLabel, Region]:
+    """Lower a single expression into a self-contained child region.
 
-
-def lower_annotation_expr(
-    state: CompilerState, ctx: RegionContext, expr: ast.AST
-) -> TemporaryValue:
-    if future_annotations_enabled(ctx.code_obj):
-        return const_value(state, ctx, ast.unparse(expr), expr)
-    return lower_expr(state, ctx, expr)
+    Used for annotation targets and annotation values: the expression is
+    lowered to ordinary IR (resolving names against the *enclosing* scope,
+    since an annotation is not a separate Python scope) and returned as a
+    nested region ending in ``Return``.  Nothing is emitted into ``ctx``'s
+    block, so the annotation never runs unless an interpreter evaluates the
+    region explicitly.
+    """
+    label = fresh_child_region_label(ctx)
+    builder = BlockBuilder()
+    builder.start()
+    previous_finally_stack = state.finally_stack
+    state.finally_stack = []
+    state.region_nested_stacks.append([])
+    state.synthetic_region_name_stacks.append({})
+    sub_ctx = RegionContext(
+        name=ctx.name,
+        name_path=ctx.name_path,
+        is_class=ctx.is_class,
+        node=expr,
+        table=ctx.table,
+        code_obj=ctx.code_obj,
+        builder=builder,
+        child_tables=list(ctx.table.get_children()),
+        child_codes=child_code_objects(state, ctx.code_obj),
+    )
+    value = lower_expr(state, sub_ctx, expr)
+    builder.terminate(attach_meta(state, Return(value=value), expr))
+    nested_regions = state.region_nested_stacks.pop()
+    state.synthetic_region_name_stacks.pop()
+    state.finally_stack = previous_finally_stack
+    basic_blocks = builder.finish()
+    region = Region(
+        name=name,
+        entry_label=basic_blocks[0].label,
+        label=label,
+        is_class=False,
+        basic_blocks=basic_blocks,
+        child_regions=COWList(nested_regions),
+    )
+    return label, region
 
 
 def lower_function_def(
@@ -766,7 +952,6 @@ def lower_function_def(
     is_async: bool,
 ) -> List[Region]:
     # Build the nested function region first, then wrap it in a runtime function object.
-    ensure_simple_arguments(state, node)
     child_table, child_code = take_child_region_inputs(
         state,
         parent_ctx,
@@ -788,6 +973,9 @@ def lower_function_def(
         is_class=False,
         label=child_label,
     )
+    # Decorator expressions are evaluated before defaults/annotations and in
+    # source order; they are applied after the function is built, bottom-up.
+    decorator_values = [lower_expr(state, parent_ctx, d) for d in node.decorator_list]
     default_values = COWList(
         [lower_expr(state, parent_ctx, value) for value in node.args.defaults]
     )
@@ -796,7 +984,11 @@ def lower_function_def(
         if default is None:
             continue
         kwonly_items.append((arg.arg, lower_expr(state, parent_ctx, default)))
+    # Annotations are lowered into their own nested expression regions so
+    # signatures are lazy: they are never evaluated when the enclosing region
+    # runs, which keeps forward references (common in stubs) from failing.
     annotation_items = []
+    annotation_regions = []
     all_annotated_args = list(node.args.posonlyargs) + list(node.args.args)
     if node.args.vararg is not None:
         all_annotated_args.append(node.args.vararg)
@@ -805,13 +997,18 @@ def lower_function_def(
         all_annotated_args.append(node.args.kwarg)
     for arg in all_annotated_args:
         if arg.annotation is not None:
-            annotation_items.append(
-                (arg.arg, lower_annotation_expr(state, parent_ctx, arg.annotation))
+            label, region = lower_expression_region(
+                state, parent_ctx, arg.annotation, "<annotation>"
             )
+            annotation_items.append((arg.arg, label))
+            annotation_regions.append(region)
     if node.returns is not None:
-        annotation_items.append(
-            ("return", lower_annotation_expr(state, parent_ctx, node.returns))
+        label, region = lower_expression_region(
+            state, parent_ctx, node.returns, "<annotation>"
         )
+        annotation_items.append(("return", label))
+        annotation_regions.append(region)
+    type_params, type_param_regions = lower_type_params(state, parent_ctx, node)
     func_temp = fresh_temp(state)
     parent_ctx.builder.emit(
         attach_meta(
@@ -822,13 +1019,14 @@ def lower_function_def(
                 defaults=default_values,
                 kwdefaults=COWList(kwonly_items),
                 annotations=COWList(annotation_items),
+                type_params=COWList(type_params),
+                flags=CodeFlag(child_code.co_flags),
             ),
             node,
         )
     )
     decorated = func_temp
-    for decorator in reversed(node.decorator_list):
-        decorator_value = lower_expr(state, parent_ctx, decorator)
+    for decorator_value in reversed(decorator_values):
         call_temp = fresh_temp(state)
         parent_ctx.builder.emit(
             attach_meta(
@@ -838,9 +1036,8 @@ def lower_function_def(
                     callee=decorator_value,
                     args=normal_call_args([decorated]),
                     kwargs=normal_call_kwargs(),
-                    flags=0,
                 ),
-                decorator,
+                node,
             )
         )
         decorated = call_temp
@@ -848,7 +1045,7 @@ def lower_function_def(
     parent_ctx.builder.emit(
         attach_meta(state, StoreName(src=decorated, scope=scope, name=node.name), node)
     )
-    return [nested_region]
+    return [nested_region] + annotation_regions + type_param_regions
 
 
 def lower_class_def(
@@ -876,9 +1073,18 @@ def lower_class_def(
         is_class=True,
         label=child_label,
     )
+    # Decorator expressions are evaluated before bases/keywords and in source
+    # order; they are applied after the class is built, bottom-up.
+    decorator_values = [lower_expr(state, parent_ctx, d) for d in node.decorator_list]
     body_func = fresh_temp(state)
     parent_ctx.builder.emit(
-        attach_meta(state, MakeFunction(dst=body_func, code=child_label), node)
+        attach_meta(
+            state,
+            MakeFunction(
+                dst=body_func, code=child_label, flags=CodeFlag(child_code.co_flags)
+            ),
+            node,
+        )
     )
     name_temp = const_value(state, parent_ctx, node.name, node)
     bases = [lower_expr(state, parent_ctx, base) for base in node.bases]
@@ -889,6 +1095,7 @@ def lower_class_def(
                 keyword, "class **kwargs are not implemented in AST lowering"
             )
         keywords.append((keyword.arg, lower_expr(state, parent_ctx, keyword.value)))
+    type_params, type_param_regions = lower_type_params(state, parent_ctx, node)
     class_temp = fresh_temp(state)
     parent_ctx.builder.emit(
         attach_meta(
@@ -899,13 +1106,13 @@ def lower_class_def(
                 name=name_temp,
                 bases=COWList(bases),
                 keywords=COWList(keywords),
+                type_params=COWList(type_params),
             ),
             node,
         )
     )
     decorated = class_temp
-    for decorator in reversed(node.decorator_list):
-        decorator_value = lower_expr(state, parent_ctx, decorator)
+    for decorator_value in reversed(decorator_values):
         call_temp = fresh_temp(state)
         parent_ctx.builder.emit(
             attach_meta(
@@ -915,9 +1122,8 @@ def lower_class_def(
                     callee=decorator_value,
                     args=normal_call_args([decorated]),
                     kwargs=normal_call_kwargs(),
-                    flags=0,
                 ),
-                decorator,
+                node,
             )
         )
         decorated = call_temp
@@ -925,7 +1131,7 @@ def lower_class_def(
     parent_ctx.builder.emit(
         attach_meta(state, StoreName(src=decorated, scope=scope, name=node.name), node)
     )
-    return [nested_region]
+    return [nested_region] + type_param_regions
 
 
 def lower_if(
@@ -988,7 +1194,6 @@ def lower_assert(
                     callee=assertion_error,
                     args=normal_call_args([msg]),
                     kwargs=normal_call_kwargs(),
-                    flags=0,
                 ),
                 stmt.msg,
             )
@@ -1017,35 +1222,137 @@ def current_loop(
     return state.loop_stack[-1]
 
 
+def emit_exit(
+    state: CompilerState,
+    ctx: RegionContext,
+    kind: EarlyExitKind,
+    payload: Any,
+    node: ast.AST,
+) -> None:
+    """Terminate a block with an early exit, routing it through any active
+    finally/with cleanup first.
+
+    When a cleanup context is active, the exit is deferred: we jump to a
+    dedicated cleanup block and record the exit so the enclosing ``try``/
+    ``with`` lowering can run its cleanup and then re-emit the exit (which may
+    be intercepted again by an outer cleanup).
+    """
+    cleanup = state.finally_stack[-1] if state.finally_stack else None
+    if cleanup is not None:
+        cleanup_label = ctx.builder.new_label()
+        cleanup.exits.append((cleanup_label, kind, payload, cleanup.pop_count))
+        ctx.builder.terminate(attach_meta(state, Jump(target=cleanup_label), node))
+        return
+    if kind == EarlyExitKind.RETURN:
+        ctx.builder.terminate(attach_meta(state, Return(value=payload), node))
+        return
+    if kind in (EarlyExitKind.BREAK, EarlyExitKind.CONTINUE):
+        ctx.builder.terminate(attach_meta(state, Escape(target=payload), node))
+        return
+    raise UnsupportedFeature(node, "unknown early exit kind %r" % kind)
+
+
+def process_cleanup_exits(
+    state: CompilerState, ctx: RegionContext, cleanup: "CleanupContext"
+) -> List[Region]:
+    """Emit one cleanup block per deferred early exit."""
+    nested_regions = []
+    original_used_child_tables = set(ctx.used_child_tables)
+    original_used_child_codes = set(ctx.used_child_codes)
+    for cleanup_label, kind, payload, pop_count in cleanup.exits:
+        ctx.builder.start_block(cleanup_label)
+        for _ in range(pop_count):
+            ctx.builder.emit(attach_meta(state, PopTry(), cleanup.owner))
+        if cleanup.kind == CleanupKind.TRY:
+            # A finally body is emitted independently for each early-exit path.
+            # Reuse its symbol-table/code inputs for each CFG copy; the normal
+            # exceptional path below will consume them permanently.
+            ctx.used_child_tables = set(original_used_child_tables)
+            ctx.used_child_codes = set(original_used_child_codes)
+            nested_regions.extend(lower_stmt_list(state, ctx, cleanup.finalbody))
+        elif cleanup.kind == CleanupKind.WITH:
+            none1 = const_value(state, ctx, None, cleanup.owner)
+            none2 = const_value(state, ctx, None, cleanup.owner)
+            none3 = const_value(state, ctx, None, cleanup.owner)
+            if cleanup.is_async:
+                call_and_await(
+                    state, ctx, cleanup.exit_fn, [none1, none2, none3], cleanup.owner
+                )
+            else:
+                ignored = fresh_temp(state)
+                ctx.builder.emit(
+                    attach_meta(
+                        state,
+                        Call(
+                            dst=ignored,
+                            callee=cleanup.exit_fn,
+                            args=normal_call_args([none1, none2, none3]),
+                            kwargs=normal_call_kwargs(),
+                        ),
+                        cleanup.owner,
+                    )
+                )
+        if ctx.builder.is_open():
+            emit_exit(state, ctx, kind, payload, cleanup.owner)
+    ctx.used_child_tables = original_used_child_tables
+    ctx.used_child_codes = original_used_child_codes
+    return nested_regions
+
+
 def lower_break(
     state: CompilerState, ctx: RegionContext, stmt: ast.Break
 ) -> None:
     break_label, _ = current_loop(state, stmt)
-    ctx.builder.terminate(attach_meta(state, Escape(target=break_label), stmt))
+    emit_exit(state, ctx, EarlyExitKind.BREAK, break_label, stmt)
 
 
 def lower_continue(
     state: CompilerState, ctx: RegionContext, stmt: ast.Continue
 ) -> None:
     _, continue_label = current_loop(state, stmt)
-    ctx.builder.terminate(attach_meta(state, Escape(target=continue_label), stmt))
+    emit_exit(state, ctx, EarlyExitKind.CONTINUE, continue_label, stmt)
 
 
 def lower_import(
     state: CompilerState, ctx: RegionContext, stmt: ast.Import
 ) -> None:
     for alias in stmt.names:
+        # ``import a.b`` binds the top-level package ``a`` (and Python also
+        # imports ``a.b`` as a side effect); ``import a.b as c`` binds ``c`` to
+        # ``a.b`` itself.  We keep the IR simple and bind the package for the
+        # plain dotted form, matching Python's visible name binding.
+        if alias.asname is not None:
+            import_module = alias.name
+            store_name = alias.asname
+        else:
+            import_module = alias.name.split(".", 1)[0]
+            store_name = import_module
+            if import_module != alias.name:
+                # Import the complete dotted path for its package-loading side
+                # effects, then bind the top-level package below.
+                imported_submodule = fresh_temp(state)
+                ctx.builder.emit(
+                    attach_meta(
+                        state,
+                        ImportName(
+                            dst=imported_submodule,
+                            module=alias.name,
+                            fromlist=COWList(),
+                            level=0,
+                        ),
+                        stmt,
+                    )
+                )
         module_temp = fresh_temp(state)
         ctx.builder.emit(
             attach_meta(
                 state,
                 ImportName(
-                    dst=module_temp, module=alias.name, fromlist=COWList(), level=0
+                    dst=module_temp, module=import_module, fromlist=COWList(), level=0
                 ),
                 stmt,
             )
         )
-        store_name = alias.asname or alias.name.split(".", 1)[0]
         scope = scope_for_store(state, ctx, store_name)
         ctx.builder.emit(
             attach_meta(
@@ -1096,11 +1403,14 @@ def lower_import_from(
 def lower_augassign(
     state: CompilerState, ctx: RegionContext, stmt: ast.AugAssign
 ) -> None:
-    value = lower_expr(state, ctx, stmt.value)
+    # Python evaluates the target (object and key) and reads its current value
+    # *before* evaluating the right-hand side.  Lower the RHS last so the
+    # generated IR preserves that order.
     op = binary_op(state, stmt.op)
     target = stmt.target
     if isinstance(target, ast.Name):
         current = lower_expr(state, ctx, ast.Name(id=target.id, ctx=ast.Load()))
+        value = lower_expr(state, ctx, stmt.value)
         result = fresh_temp(state)
         ctx.builder.emit(
             attach_meta(
@@ -1120,6 +1430,7 @@ def lower_augassign(
                 state, LoadAttr(dst=current, obj=obj, attr_name=target.attr), target
             )
         )
+        value = lower_expr(state, ctx, stmt.value)
         result = fresh_temp(state)
         ctx.builder.emit(
             attach_meta(
@@ -1139,6 +1450,7 @@ def lower_augassign(
         ctx.builder.emit(
             attach_meta(state, LoadItem(dst=current, obj=obj, key=key), target)
         )
+        value = lower_expr(state, ctx, stmt.value)
         result = fresh_temp(state)
         ctx.builder.emit(
             attach_meta(
@@ -1165,7 +1477,7 @@ def lower_for(
     ctx.builder.emit(
         attach_meta(state, GetIter(dst=iter_temp, iterable=iterable), stmt.iter)
     )
-    iter_name = fresh_synthetic_local(state, "for_iter")
+    iter_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.FOR_ITER))
     ctx.builder.emit(
         attach_meta(
             state, StoreName(src=iter_temp, scope=Scope.LOCAL, name=iter_name), stmt
@@ -1265,7 +1577,7 @@ def lower_async_for(
     ctx.builder.emit(
         attach_meta(state, GetAIter(dst=aiter_temp, iterable=iterable), stmt.iter)
     )
-    iter_name = fresh_synthetic_local(state, "async_for_iter")
+    iter_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.ASYNC_FOR_ITER))
     ctx.builder.emit(
         attach_meta(
             state, StoreName(src=aiter_temp, scope=Scope.LOCAL, name=iter_name), stmt
@@ -1348,7 +1660,7 @@ def await_value(
 ) -> TemporaryValue:
     awaitable = fresh_temp(state)
     ctx.builder.emit(
-        attach_meta(state, GetAwaitable(dst=awaitable, value=value, where=0), node)
+        attach_meta(state, GetAwaitable(dst=awaitable, value=value), node)
     )
     awaited = fresh_temp(state)
     ctx.builder.emit(attach_meta(state, AwaitValue(dst=awaited, value=awaitable), node))
@@ -1371,7 +1683,6 @@ def call_and_await(
                 callee=callee,
                 args=normal_call_args(args),
                 kwargs=normal_call_kwargs(),
-                flags=0,
             ),
             node,
         )
@@ -1435,7 +1746,6 @@ def lower_with_items(
                     callee=enter_fn,
                     args=normal_call_args(),
                     kwargs=normal_call_kwargs(),
-                    flags=0,
                 ),
                 item.context_expr,
             )
@@ -1449,12 +1759,22 @@ def lower_with_items(
     propagate_label = ctx.builder.new_label()
     after_label = ctx.builder.new_label()
     ctx.builder.emit(attach_meta(state, PushTry(finally_label=finally_label), owner))
+    cleanup = CleanupContext(
+        kind=CleanupKind.WITH,
+        owner=owner,
+        pop_count=1,
+        exit_fn=exit_fn,
+        is_async=is_async,
+    )
+    state.finally_stack.append(cleanup)
     nested_regions.extend(
         lower_with_items(state, ctx, items[1:], body, owner, is_async=is_async)
     )
     if ctx.builder.is_open():
         ctx.builder.emit(attach_meta(state, PopTry(), owner))
         ctx.builder.terminate(attach_meta(state, Jump(target=finally_label), owner))
+    state.finally_stack.pop()
+    nested_regions.extend(process_cleanup_exits(state, ctx, cleanup))
     ctx.builder.start_block(finally_label)
     current_exc = current_exception_value(state, ctx, owner)
     none_exc = const_value(state, ctx, None, owner)
@@ -1462,7 +1782,12 @@ def lower_with_items(
     ctx.builder.emit(
         attach_meta(
             state,
-            CompareOp(dst=is_none, cmp="is", lhs=current_exc, rhs=none_exc),
+            CompareOp(
+                dst=is_none,
+                cmp=ComparisonOperator.IS,
+                lhs=current_exc,
+                rhs=none_exc,
+            ),
             owner,
         )
     )
@@ -1493,7 +1818,6 @@ def lower_with_items(
                     callee=exit_fn,
                     args=normal_call_args([none1, none2, none3]),
                     kwargs=normal_call_kwargs(),
-                    flags=0,
                 ),
                 owner,
             )
@@ -1512,7 +1836,6 @@ def lower_with_items(
                 callee=type_name,
                 args=normal_call_args([current_exc]),
                 kwargs=normal_call_kwargs(),
-                flags=0,
             ),
             owner,
         )
@@ -1539,7 +1862,6 @@ def lower_with_items(
                     callee=exit_fn,
                     args=normal_call_args([exc_type, current_exc, traceback]),
                     kwargs=normal_call_kwargs(),
-                    flags=0,
                 ),
                 owner,
             )
@@ -1566,14 +1888,22 @@ def lower_with_items(
     return nested_regions
 
 
-def lower_try(
-    state: CompilerState, ctx: RegionContext, stmt: ast.Try
+def lower_try_common(
+    state: CompilerState,
+    ctx: RegionContext,
+    stmt: ast.Try,
+    kind: TryKind,
 ) -> List[Region]:
     nested_regions = []
+    match_cls = (
+        CheckEGMatch if kind == TryKind.EXCEPTION_GROUP else CheckExcMatch
+    )
     # Try statements are represented with explicit synthetic try targets and CFG dispatch blocks.
     if not stmt.handlers and (not stmt.finalbody):
         raise UnsupportedFeature(
-            stmt, "try without except/finally is not implemented in AST lowering"
+            stmt,
+            "%s without except/finally is not implemented in AST lowering"
+            % kind.value,
         )
     except_dispatch_label = ctx.builder.new_label() if stmt.handlers else None
     finally_label = ctx.builder.new_label() if stmt.finalbody else None
@@ -1585,6 +1915,16 @@ def lower_try(
         ctx.builder.emit(
             attach_meta(state, PushTry(except_label=except_dispatch_label), stmt)
         )
+    cleanup = None
+    if stmt.finalbody:
+        pop_count = (1 if stmt.finalbody else 0) + (1 if stmt.handlers else 0)
+        cleanup = CleanupContext(
+            kind=CleanupKind.TRY,
+            owner=stmt,
+            pop_count=pop_count,
+            finalbody=stmt.finalbody,
+        )
+        state.finally_stack.append(cleanup)
     nested_regions.extend(lower_stmt_list(state, ctx, stmt.body))
     if ctx.builder.is_open():
         if stmt.handlers:
@@ -1598,6 +1938,9 @@ def lower_try(
             ctx.builder.terminate(attach_meta(state, Jump(target=after_label), stmt))
     if stmt.orelse:
         ctx.builder.start_block(orelse_label)
+        if cleanup is not None:
+            # The except handler was popped before entering the else suite.
+            cleanup.pop_count = 1
         nested_regions.extend(lower_stmt_list(state, ctx, stmt.orelse))
         if ctx.builder.is_open():
             if stmt.finalbody:
@@ -1611,6 +1954,10 @@ def lower_try(
                 )
     if stmt.handlers:
         ctx.builder.start_block(except_dispatch_label)
+        if cleanup is not None:
+            # Exception dispatch consumed the except handler; only the
+            # surrounding finally handler remains active in handler bodies.
+            cleanup.pop_count = 1
         current_exc = current_exception_value(state, ctx, stmt)
         no_match_label = ctx.builder.new_label()
         next_label = None
@@ -1628,7 +1975,7 @@ def lower_try(
                 ctx.builder.emit(
                     attach_meta(
                         state,
-                        CheckExcMatch(dst=match, exc=current_exc, typ=typ),
+                        match_cls(dst=match, exc=current_exc, typ=typ),
                         handler,
                     )
                 )
@@ -1682,6 +2029,9 @@ def lower_try(
                 ctx.builder.start_block(next_label)
         ctx.builder.start_block(no_match_label)
         ctx.builder.terminate(attach_meta(state, Reraise(), stmt))
+    if cleanup is not None:
+        state.finally_stack.pop()
+        nested_regions.extend(process_cleanup_exits(state, ctx, cleanup))
     if stmt.finalbody:
         ctx.builder.start_block(finally_label)
         nested_regions.extend(lower_stmt_list(state, ctx, stmt.finalbody))
@@ -1693,141 +2043,25 @@ def lower_try(
                 )
     ctx.builder.start_block(after_label)
     return nested_regions
+
+
+def lower_try(
+    state: CompilerState, ctx: RegionContext, stmt: ast.Try
+) -> List[Region]:
+    return lower_try_common(state, ctx, stmt, TryKind.NORMAL)
 
 
 def lower_try_star(
     state: CompilerState, ctx: RegionContext, stmt: ast.Try
 ) -> List[Region]:
-    nested_regions = []
-    # Exception groups use the same explicit CFG shape as `try`, but handler tests go through
-    # the dedicated exception-group matcher instruction.
-    if not stmt.handlers and (not stmt.finalbody):
-        raise UnsupportedFeature(
-            stmt, "try* without except/finally is not implemented in AST lowering"
-        )
-    except_dispatch_label = ctx.builder.new_label() if stmt.handlers else None
-    finally_label = ctx.builder.new_label() if stmt.finalbody else None
-    after_label = ctx.builder.new_label()
-    orelse_label = ctx.builder.new_label() if stmt.orelse else after_label
-    if stmt.finalbody:
-        ctx.builder.emit(attach_meta(state, PushTry(finally_label=finally_label), stmt))
-    if stmt.handlers:
-        ctx.builder.emit(
-            attach_meta(state, PushTry(except_label=except_dispatch_label), stmt)
-        )
-    nested_regions.extend(lower_stmt_list(state, ctx, stmt.body))
-    if ctx.builder.is_open():
-        if stmt.handlers:
-            ctx.builder.emit(attach_meta(state, PopTry(), stmt))
-        if stmt.orelse:
-            ctx.builder.terminate(attach_meta(state, Jump(target=orelse_label), stmt))
-        elif stmt.finalbody:
-            ctx.builder.emit(attach_meta(state, PopTry(), stmt))
-            ctx.builder.terminate(attach_meta(state, Jump(target=finally_label), stmt))
-        else:
-            ctx.builder.terminate(attach_meta(state, Jump(target=after_label), stmt))
-    if stmt.orelse:
-        ctx.builder.start_block(orelse_label)
-        nested_regions.extend(lower_stmt_list(state, ctx, stmt.orelse))
-        if ctx.builder.is_open():
-            if stmt.finalbody:
-                ctx.builder.emit(attach_meta(state, PopTry(), stmt))
-                ctx.builder.terminate(
-                    attach_meta(state, Jump(target=finally_label), stmt)
-                )
-            else:
-                ctx.builder.terminate(
-                    attach_meta(state, Jump(target=after_label), stmt)
-                )
-    if stmt.handlers:
-        ctx.builder.start_block(except_dispatch_label)
-        current_exc = current_exception_value(state, ctx, stmt)
-        no_match_label = ctx.builder.new_label()
-        next_label = None
-        for index, handler in enumerate(stmt.handlers):
-            is_last = index == len(stmt.handlers) - 1
-            body_label = ctx.builder.new_label()
-            next_label = no_match_label if is_last else ctx.builder.new_label()
-            if handler.type is None:
-                ctx.builder.terminate(
-                    attach_meta(state, Jump(target=body_label), handler)
-                )
-            else:
-                typ = lower_expr(state, ctx, handler.type)
-                match = fresh_temp(state)
-                ctx.builder.emit(
-                    attach_meta(
-                        state,
-                        CheckEGMatch(dst=match, exc=current_exc, typ=typ),
-                        handler,
-                    )
-                )
-                ctx.builder.terminate(
-                    attach_meta(
-                        state,
-                        Branch(
-                            cond=match, true_label=body_label, false_label=next_label
-                        ),
-                        handler,
-                    )
-                )
-            ctx.builder.start_block(body_label)
-            if handler.name:
-                scope = scope_for_store(state, ctx, handler.name)
-                ctx.builder.emit(
-                    attach_meta(
-                        state,
-                        StoreName(src=current_exc, scope=scope, name=handler.name),
-                        handler,
-                    )
-                )
-            nested_regions.extend(lower_stmt_list(state, ctx, handler.body))
-            if ctx.builder.is_open():
-                if handler.name:
-                    none_temp = const_value(state, ctx, None, handler)
-                    scope = scope_for_store(state, ctx, handler.name)
-                    ctx.builder.emit(
-                        attach_meta(
-                            state,
-                            StoreName(src=none_temp, scope=scope, name=handler.name),
-                            handler,
-                        )
-                    )
-                    ctx.builder.emit(
-                        attach_meta(
-                            state, DeleteName(scope=scope, name=handler.name), handler
-                        )
-                    )
-                ctx.builder.emit(attach_meta(state, ClearException(), handler))
-                if stmt.finalbody:
-                    ctx.builder.emit(attach_meta(state, PopTry(), handler))
-                    ctx.builder.terminate(
-                        attach_meta(state, Jump(target=finally_label), handler)
-                    )
-                else:
-                    ctx.builder.terminate(
-                        attach_meta(state, Jump(target=after_label), handler)
-                    )
-            if not is_last:
-                ctx.builder.start_block(next_label)
-        ctx.builder.start_block(no_match_label)
-        ctx.builder.terminate(attach_meta(state, Reraise(), stmt))
-    if stmt.finalbody:
-        ctx.builder.start_block(finally_label)
-        nested_regions.extend(lower_stmt_list(state, ctx, stmt.finalbody))
-        if ctx.builder.is_open():
-            ctx.builder.emit(attach_meta(state, EndFinally(), stmt))
-            if ctx.builder.is_open():
-                ctx.builder.terminate(
-                    attach_meta(state, Jump(target=after_label), stmt)
-                )
-    ctx.builder.start_block(after_label)
-    return nested_regions
+    return lower_try_common(state, ctx, stmt, TryKind.EXCEPTION_GROUP)
 
 
 def bind_pattern_name(
     state: CompilerState,
     ctx: RegionContext,
+    bindings: List[Tuple[Scope, str, TemporaryValue]],
+    bound_names: List[Tuple[Scope, str]],
     name: Optional[str],
     value: TemporaryValue,
     node: ast.AST,
@@ -1835,9 +2069,54 @@ def bind_pattern_name(
     if name is None:
         return
     scope = scope_for_store(state, ctx, name)
-    ctx.builder.emit(
-        attach_meta(state, StoreName(src=value, scope=scope, name=name), node)
-    )
+    # Pattern captures are deferred until the whole case (or, for ``|``
+    # alternatives, the whole alternative) has matched.  ``bound_names`` is
+    # used to clean up on guard failure.
+    bindings.append((scope, name, value))
+    bound_names.append((scope, name))
+
+
+def emit_pattern_bindings(
+    state: CompilerState,
+    ctx: RegionContext,
+    bindings: List[Tuple[Scope, str, TemporaryValue]],
+    node: ast.AST,
+) -> None:
+    for scope, name, value in bindings:
+        ctx.builder.emit(
+            attach_meta(state, StoreName(src=value, scope=scope, name=name), node)
+        )
+
+
+def emit_delete_names(
+    state: CompilerState,
+    ctx: RegionContext,
+    bound_names: List[Tuple[Scope, str]],
+    target: BasicBlockLabel,
+    node: ast.AST,
+) -> None:
+    """Emit tolerant deletes for guard-failure cleanup, then jump to *target*.
+
+    Deletion is wrapped in a synthetic try/except so a name captured by a
+    different ``|`` alternative (and therefore never actually bound on the
+    failing path) does not abort the cleanup.
+    """
+    for scope, name in bound_names:
+        missing_label = ctx.builder.new_label()
+        next_label = ctx.builder.new_label()
+        ctx.builder.emit(
+            attach_meta(state, PushTry(except_label=missing_label), node)
+        )
+        ctx.builder.emit(
+            attach_meta(state, DeleteName(scope=scope, name=name), node)
+        )
+        ctx.builder.emit(attach_meta(state, PopTry(), node))
+        ctx.builder.terminate(attach_meta(state, Jump(target=next_label), node))
+        ctx.builder.start_block(missing_label)
+        ctx.builder.emit(attach_meta(state, ClearException(), node))
+        ctx.builder.terminate(attach_meta(state, Jump(target=next_label), node))
+        ctx.builder.start_block(next_label)
+    ctx.builder.terminate(attach_meta(state, Jump(target=target), node))
 
 
 def emit_call(
@@ -1856,7 +2135,6 @@ def emit_call(
                 callee=callee,
                 args=normal_call_args(args),
                 kwargs=normal_call_kwargs(),
-                flags=0,
             ),
             node,
         )
@@ -1886,7 +2164,11 @@ def emit_pattern_length_check(
     length = emit_builtin_call(state, ctx, builtins.len, [subject], node)
     wanted = const_value(state, ctx, expected, node)
     matched = fresh_temp(state)
-    cmp = ">=" if allow_extra else "=="
+    cmp = (
+        ComparisonOperator.GREATER_THAN_OR_EQUAL
+        if allow_extra
+        else ComparisonOperator.EQUAL
+    )
     ctx.builder.emit(
         attach_meta(
             state, CompareOp(dst=matched, cmp=cmp, lhs=length, rhs=wanted), node
@@ -1896,7 +2178,7 @@ def emit_pattern_length_check(
 
 
 def lower_match(
-    state: CompilerState, ctx: RegionContext, stmt: ast.Match
+    state: CompilerState, ctx: RegionContext, stmt: "ast.Match"
 ) -> List[Region]:
     nested_regions = []
     subject = lower_expr(state, ctx, stmt.subject)
@@ -1906,10 +2188,20 @@ def lower_match(
         failure_label = (
             end_label if index == len(stmt.cases) - 1 else ctx.builder.new_label()
         )
-        lower_pattern(state, ctx, case.pattern, subject, body_label, failure_label)
+        bindings: List[Tuple[Scope, str, TemporaryValue]] = []
+        bound_names: List[Tuple[Scope, str]] = []
+        lower_pattern(
+            state, ctx, case.pattern, subject, body_label, failure_label,
+            bindings, bound_names,
+        )
         ctx.builder.start_block(body_label)
+        # The whole pattern matched; bind its captures now so a guard (if any)
+        # can reference them, but the bindings can still be cleaned up if the
+        # guard fails.
+        emit_pattern_bindings(state, ctx, bindings, case.pattern)
         if case.guard is not None:
             guarded_body_label = ctx.builder.new_label()
+            guard_failure_cleanup = ctx.builder.new_label()
             guard = lower_expr(state, ctx, case.guard)
             ctx.builder.terminate(
                 attach_meta(
@@ -1917,10 +2209,16 @@ def lower_match(
                     Branch(
                         cond=guard,
                         true_label=guarded_body_label,
-                        false_label=failure_label,
+                        false_label=guard_failure_cleanup,
                     ),
                     case.guard,
                 )
+            )
+            ctx.builder.start_block(guard_failure_cleanup)
+            # Captures are bound before the guard is evaluated and remain
+            # visible when a successful pattern's guard is false.
+            ctx.builder.terminate(
+                attach_meta(state, Jump(target=failure_label), case.guard)
             )
             ctx.builder.start_block(guarded_body_label)
         nested_regions.extend(lower_stmt_list(state, ctx, case.body))
@@ -1937,10 +2235,12 @@ def lower_match(
 def lower_pattern_values(
     state: CompilerState,
     ctx: RegionContext,
-    patterns: List[ast.pattern],
+    patterns: List["ast.pattern"],
     values: List[TemporaryValue],
     success_label: BasicBlockLabel,
     failure_label: BasicBlockLabel,
+    bindings: List[Tuple[Scope, str, TemporaryValue]],
+    bound_names: List[Tuple[Scope, str]],
     node: ast.AST,
 ) -> None:
     if len(patterns) != len(values):
@@ -1951,7 +2251,10 @@ def lower_pattern_values(
     for index, (pattern, value) in enumerate(zip(patterns, values)):
         is_last = index == len(patterns) - 1
         next_label = success_label if is_last else ctx.builder.new_label()
-        lower_pattern(state, ctx, pattern, value, next_label, failure_label)
+        lower_pattern(
+            state, ctx, pattern, value, next_label, failure_label,
+            bindings, bound_names,
+        )
         if not is_last:
             ctx.builder.start_block(next_label)
 
@@ -1959,24 +2262,31 @@ def lower_pattern_values(
 def lower_pattern(
     state: CompilerState,
     ctx: RegionContext,
-    pattern: ast.pattern,
+    pattern: "ast.pattern",
     subject: TemporaryValue,
     success_label: BasicBlockLabel,
     failure_label: BasicBlockLabel,
+    bindings: List[Tuple[Scope, str, TemporaryValue]],
+    bound_names: List[Tuple[Scope, str]],
 ) -> None:
     if isinstance(pattern, ast.MatchAs):
         if pattern.pattern is None:
-            bind_pattern_name(state, ctx, pattern.name, subject, pattern)
+            bind_pattern_name(
+                state, ctx, bindings, bound_names, pattern.name, subject, pattern
+            )
             ctx.builder.terminate(
                 attach_meta(state, Jump(target=success_label), pattern)
             )
             return
         matched_label = ctx.builder.new_label()
         lower_pattern(
-            state, ctx, pattern.pattern, subject, matched_label, failure_label
+            state, ctx, pattern.pattern, subject, matched_label, failure_label,
+            bindings, bound_names,
         )
         ctx.builder.start_block(matched_label)
-        bind_pattern_name(state, ctx, pattern.name, subject, pattern)
+        bind_pattern_name(
+            state, ctx, bindings, bound_names, pattern.name, subject, pattern
+        )
         ctx.builder.terminate(attach_meta(state, Jump(target=success_label), pattern))
         return
     if isinstance(pattern, ast.MatchValue):
@@ -1985,7 +2295,12 @@ def lower_pattern(
         ctx.builder.emit(
             attach_meta(
                 state,
-                CompareOp(dst=matched, cmp="==", lhs=subject, rhs=wanted),
+                CompareOp(
+                    dst=matched,
+                    cmp=ComparisonOperator.EQUAL,
+                    lhs=subject,
+                    rhs=wanted,
+                ),
                 pattern,
             )
         )
@@ -2005,7 +2320,12 @@ def lower_pattern(
         ctx.builder.emit(
             attach_meta(
                 state,
-                CompareOp(dst=matched, cmp="is", lhs=subject, rhs=wanted),
+                CompareOp(
+                    dst=matched,
+                    cmp=ComparisonOperator.IS,
+                    lhs=subject,
+                    rhs=wanted,
+                ),
                 pattern,
             )
         )
@@ -2020,13 +2340,26 @@ def lower_pattern(
         )
         return
     if isinstance(pattern, ast.MatchOr):
+        # Each alternative is a separate match path.  Defer its captures until
+        # the whole alternative matches, then store them at its success edge so
+        # a failed alternative leaves no bindings behind.
         for index, alternative in enumerate(pattern.patterns):
             next_failure = (
                 failure_label
                 if index == len(pattern.patterns) - 1
                 else ctx.builder.new_label()
             )
-            lower_pattern(state, ctx, alternative, subject, success_label, next_failure)
+            alt_success = ctx.builder.new_label()
+            alt_bindings: List[Tuple[Scope, str, TemporaryValue]] = []
+            lower_pattern(
+                state, ctx, alternative, subject, alt_success, next_failure,
+                alt_bindings, bound_names,
+            )
+            ctx.builder.start_block(alt_success)
+            emit_pattern_bindings(state, ctx, alt_bindings, pattern)
+            ctx.builder.terminate(
+                attach_meta(state, Jump(target=success_label), pattern)
+            )
             if next_failure is not failure_label:
                 ctx.builder.start_block(next_failure)
         return
@@ -2091,6 +2424,8 @@ def lower_pattern(
                 values,
                 success_label,
                 failure_label,
+                bindings,
+                bound_names,
                 pattern,
             )
             return
@@ -2125,11 +2460,14 @@ def lower_pattern(
         )
         values = before_values + [star_value] + after_values
         lower_pattern_values(
-            state, ctx, pattern.patterns, values, success_label, failure_label, pattern
+            state, ctx, pattern.patterns, values, success_label, failure_label,
+            bindings, bound_names, pattern,
         )
         return
     if isinstance(pattern, ast.MatchStar):
-        bind_pattern_name(state, ctx, pattern.name, subject, pattern)
+        bind_pattern_name(
+            state, ctx, bindings, bound_names, pattern.name, subject, pattern
+        )
         ctx.builder.terminate(attach_meta(state, Jump(target=success_label), pattern))
         return
     if isinstance(pattern, ast.MatchMapping):
@@ -2172,7 +2510,12 @@ def lower_pattern(
         ctx.builder.emit(
             attach_meta(
                 state,
-                CompareOp(dst=found, cmp="is not", lhs=matched_items, rhs=none_value),
+                CompareOp(
+                    dst=found,
+                    cmp=ComparisonOperator.IS_NOT,
+                    lhs=matched_items,
+                    rhs=none_value,
+                ),
                 pattern,
             )
         )
@@ -2190,7 +2533,8 @@ def lower_pattern(
             attach_meta(state, Unpack(src=matched_items, dsts=COWList(values)), pattern)
         )
         lower_pattern_values(
-            state, ctx, pattern.patterns, values, success_label, failure_label, pattern
+            state, ctx, pattern.patterns, values, success_label, failure_label,
+            bindings, bound_names, pattern,
         )
         return
     if isinstance(pattern, ast.MatchClass):
@@ -2262,7 +2606,8 @@ def lower_pattern(
             )
             return
         lower_pattern_values(
-            state, ctx, patterns, values, success_label, failure_label, pattern
+            state, ctx, patterns, values, success_label, failure_label,
+            bindings, bound_names, pattern,
         )
         return
     raise UnsupportedFeature(
@@ -2274,7 +2619,7 @@ def lower_pattern(
 def lower_ifexp(
     state: CompilerState, ctx: RegionContext, expr: ast.IfExp
 ) -> TemporaryValue:
-    result_name = fresh_synthetic_local(state, "ifexp_result")
+    result_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.IFEXP_RESULT))
     then_label = ctx.builder.new_label()
     else_label = ctx.builder.new_label()
     end_label = ctx.builder.new_label()
@@ -2326,7 +2671,7 @@ def lower_bool_op(
         raise UnsupportedFeature(expr, "empty boolean operation is not valid")
     if len(expr.values) == 1:
         return lower_expr(state, ctx, expr.values[0])
-    result_name = fresh_synthetic_local(state, "boolop_result")
+    result_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.BOOL_OP_RESULT))
     end_label = ctx.builder.new_label()
     is_and = isinstance(expr.op, ast.And)
     for value_expr in expr.values[:-1]:
@@ -2399,7 +2744,6 @@ def emit_method_call(
                 callee=method,
                 args=normal_call_args(args),
                 kwargs=normal_call_kwargs(),
-                flags=0,
             ),
             node,
         )
@@ -2434,7 +2778,7 @@ def comprehension_iter_name(
                 state, GetIter(dst=iter_temp, iterable=iterable), generator.iter
             )
         )
-    iter_name = fresh_synthetic_local(state, "comprehension_iter")
+    iter_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.COMPREHENSION_ITER))
     ctx.builder.emit(
         attach_meta(
             state,
@@ -2668,7 +3012,15 @@ def lower_generator_exp(
             )
         )
     func = fresh_temp(state)
-    ctx.builder.emit(attach_meta(state, MakeFunction(dst=func, code=child_label), expr))
+    ctx.builder.emit(
+        attach_meta(
+            state,
+            MakeFunction(
+                dst=func, code=child_label, flags=CodeFlag(child_code.co_flags)
+            ),
+            expr,
+        )
+    )
     call = fresh_temp(state)
     ctx.builder.emit(
         attach_meta(
@@ -2678,7 +3030,6 @@ def lower_generator_exp(
                 callee=func,
                 args=normal_call_args([outer_iter]),
                 kwargs=normal_call_kwargs(),
-                flags=0,
             ),
             expr,
         )
@@ -2689,7 +3040,6 @@ def lower_generator_exp(
 def lower_lambda(
     state: CompilerState, ctx: RegionContext, expr: ast.Lambda
 ) -> TemporaryValue:
-    ensure_simple_arguments(state, expr)
     child_table, child_code = take_child_region_inputs(
         state,
         ctx,
@@ -2729,6 +3079,7 @@ def lower_lambda(
                 code=child_label,
                 defaults=default_values,
                 kwdefaults=COWList(kwonly_items),
+                flags=CodeFlag(child_code.co_flags),
             ),
             expr,
         )
@@ -2753,8 +3104,8 @@ def snapshot_comprehension_target_names(
     )
     for name in names:
         scope = scope_for_store(state, ctx, name)
-        present_name = fresh_synthetic_local(state, "saved_present")
-        value_name = fresh_synthetic_local(state, "saved_value")
+        present_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.SAVED_PRESENT))
+        value_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.SAVED_VALUE))
         missing_label = ctx.builder.new_label()
         after_label = ctx.builder.new_label()
         ctx.builder.emit(attach_meta(state, PushTry(except_label=missing_label), owner))
@@ -2909,8 +3260,8 @@ def lower_compare_expr(
         )
         return temp
 
-    current_name = fresh_synthetic_local(state, "compare_current")
-    result_name = fresh_synthetic_local(state, "compare_result")
+    current_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.COMPARE_CURRENT))
+    result_name = synthetic_local_name(fresh_synthetic_local(state, SyntheticLocalPurpose.COMPARE_RESULT))
     false_label = ctx.builder.new_label()
     end_label = ctx.builder.new_label()
 
@@ -3014,7 +3365,7 @@ def lower_expr(
     """Lower one expression and return the IR value holding its result."""
     if isinstance(expr, ast.Constant):
         return const_value(state, ctx, expr.value, expr)
-    if isinstance(expr, ast.NamedExpr):
+    if NamedExprNode is not None and isinstance(expr, NamedExprNode):
         value = lower_expr(state, ctx, expr.value)
         if not isinstance(expr.target, ast.Name):
             raise UnsupportedFeature(
@@ -3073,7 +3424,6 @@ def lower_expr(
                     callee=callee,
                     args=COWList(args),
                     kwargs=COWList(kwargs),
-                    flags=0,
                 ),
                 expr,
             )
@@ -3120,11 +3470,11 @@ def lower_expr(
         value = lower_expr(state, ctx, expr.value)
         conversion = None
         if expr.conversion == ord("s"):
-            conversion = "str"
+            conversion = FormatConversion.STR
         elif expr.conversion == ord("r"):
-            conversion = "repr"
+            conversion = FormatConversion.REPR
         elif expr.conversion == ord("a"):
-            conversion = "ascii"
+            conversion = FormatConversion.ASCII
         elif expr.conversion not in (-1, None):
             raise UnsupportedFeature(
                 expr,
@@ -3195,7 +3545,7 @@ def lower_expr(
         value = lower_expr(state, ctx, expr.value)
         awaitable = fresh_temp(state)
         ctx.builder.emit(
-            attach_meta(state, GetAwaitable(dst=awaitable, value=value, where=0), expr)
+            attach_meta(state, GetAwaitable(dst=awaitable, value=value), expr)
         )
         temp = fresh_temp(state)
         ctx.builder.emit(
@@ -3359,6 +3709,15 @@ def delete_target(
     )
 
 
+def symbol_table_region_type(table: Any) -> ChildRegionType:
+    """Normalize version-specific ``symtable`` kinds to an internal enum."""
+    raw_type = table.get_type()
+    raw_value = getattr(raw_type, "value", raw_type)
+    if raw_value in ("type parameter", "type parameters"):
+        return ChildRegionType.TYPE_PARAMETERS
+    return ChildRegionType(raw_value)
+
+
 def take_child_region_inputs(
     state: CompilerState,
     ctx: RegionContext,
@@ -3380,6 +3739,14 @@ def take_child_region_inputs(
     and name. This keeps lowering robust even when CFG emission order differs
     from textual order (e.g. try/except/else lowering).
     """
+    # PEP 695: a generic class/function/alias is wrapped in an intermediate
+    # "type parameters" scope (symtable) and a "<generic parameters of X>" code
+    # object.  Descend through that wrapper to reach the real body scope/code.
+    if getattr(owner, "type_params", None):
+        return take_generic_child_region_inputs(
+            state, ctx, table_type, symtable_name, code_name, owner
+        )
+
     owner_lineno = getattr(owner, "lineno", None)
 
     table_index = None
@@ -3387,7 +3754,7 @@ def take_child_region_inputs(
         if index in ctx.used_child_tables:
             continue
         if (
-            candidate.get_type() != table_type.value
+            symbol_table_region_type(candidate) != table_type
             or candidate.get_name() != symtable_name
         ):
             continue
@@ -3423,6 +3790,116 @@ def take_child_region_inputs(
     ctx.used_child_codes.add(code_index)
     code_obj = ctx.child_codes[code_index]
     return (table, code_obj)
+
+
+def take_generic_child_region_inputs(
+    state: CompilerState,
+    ctx: RegionContext,
+    table_type: ChildRegionType,
+    symtable_name: str,
+    code_name: str,
+    owner: ast.AST,
+) -> Tuple[Any, types.CodeType]:
+    """Resolve the body scope/code of a PEP 695 generic definition.
+
+    The enclosing scope's direct child is a "type parameters" wrapper (both in
+    the symtable and as a ``<generic parameters of X>`` code object); the real
+    class/function/alias body lives one level inside it.
+    """
+    wrapper_code_name = "<generic parameters of %s>" % symtable_name
+
+    table_index = None
+    for index, candidate in enumerate(ctx.child_tables):
+        if index in ctx.used_child_tables:
+            continue
+        if (
+            symbol_table_region_type(candidate) == ChildRegionType.TYPE_PARAMETERS
+            and candidate.get_name() == symtable_name
+        ):
+            table_index = index
+            break
+    if table_index is None:
+        raise UnsupportedFeature(owner, "missing type-parameter symbol table")
+    ctx.used_child_tables.add(table_index)
+    wrapper_table = ctx.child_tables[table_index]
+    table = None
+    for child in wrapper_table.get_children():
+        if (
+            symbol_table_region_type(child) == table_type
+            and child.get_name() == symtable_name
+        ):
+            table = child
+            break
+    if table is None:
+        raise UnsupportedFeature(owner, "missing nested symbol-table child for region")
+
+    code_index = None
+    for index, candidate in enumerate(ctx.child_codes):
+        if index in ctx.used_child_codes:
+            continue
+        if candidate.co_name == wrapper_code_name:
+            code_index = index
+            break
+    if code_index is None:
+        raise UnsupportedFeature(owner, "missing type-parameter code object")
+    ctx.used_child_codes.add(code_index)
+    wrapper_code = ctx.child_codes[code_index]
+    code_obj = None
+    for const in wrapper_code.co_consts:
+        if isinstance(const, types.CodeType) and const.co_name == code_name:
+            code_obj = const
+            break
+    if code_obj is None:
+        raise UnsupportedFeature(owner, "missing nested code object for region")
+    return (table, code_obj)
+
+
+def type_param_kind(type_param: ast.AST) -> TypeParamKind:
+    """Map a PEP 695 AST node to its structured IR kind."""
+    if TypeVarNode is not None and isinstance(type_param, TypeVarNode):
+        return TypeParamKind.TYPE_VAR
+    if ParamSpecNode is not None and isinstance(type_param, ParamSpecNode):
+        return TypeParamKind.PARAM_SPEC
+    if TypeVarTupleNode is not None and isinstance(type_param, TypeVarTupleNode):
+        return TypeParamKind.TYPE_VAR_TUPLE
+    raise UnsupportedFeature(type_param, "unknown type-parameter kind")
+
+
+def lower_type_params(
+    state: CompilerState, parent_ctx: RegionContext, owner: ast.AST
+) -> Tuple[List[TypeParam], List[Region]]:
+    """Lower a definition's PEP 695 type parameters.
+
+    Bounds/constraints and defaults are lowered into lazy nested regions in the
+    enclosing scope (where the type-parameter scope evaluates them).  Returns
+    the ``TypeParam`` descriptors and the regions they reference.
+    """
+    params = []
+    regions = []
+    for tp in getattr(owner, "type_params", None) or []:
+        bound_label = None
+        bound = getattr(tp, "bound", None)
+        if bound is not None:
+            bound_label, bound_region = lower_expression_region(
+                state, parent_ctx, bound, "<type-param-bound>"
+            )
+            regions.append(bound_region)
+        default_label = None
+        default = getattr(tp, "default_value", None)
+        if default is not None:
+            default_label, default_region = lower_expression_region(
+                state, parent_ctx, default, "<type-param-default>"
+            )
+            regions.append(default_region)
+        params.append(
+            TypeParam(
+                name=tp.name,
+                kind=type_param_kind(tp),
+                bound=bound_label,
+                default=default_label,
+            )
+        )
+    return params, regions
 
 
 def child_region_name(state: CompilerState, base_name: str) -> str:
@@ -3504,12 +3981,6 @@ def region_variadic_names(
     return (vararg, kwarg)
 
 
-def ensure_simple_arguments(
-    state: CompilerState, node: ast.AST
-) -> None:
-    return None
-
-
 def const_value(
     state: CompilerState, ctx: RegionContext, value: Any, node: ast.AST
 ) -> TemporaryValue:
@@ -3568,21 +4039,21 @@ def attach_meta(state: CompilerState, instruction: Any, node: ast.AST) -> Any:
     return attrs.evolve(instruction, span=span)
 
 
-def binary_op(state: CompilerState, op: ast.AST) -> str:
+def binary_op(state: CompilerState, op: ast.AST) -> BinaryOperator:
     mapping = {
-        ast.Add: "+",
-        ast.Sub: "-",
-        ast.Mult: "*",
-        ast.Div: "/",
-        ast.FloorDiv: "//",
-        ast.Mod: "%",
-        ast.Pow: "**",
-        ast.LShift: "<<",
-        ast.RShift: ">>",
-        ast.BitAnd: "&",
-        ast.BitOr: "|",
-        ast.BitXor: "^",
-        ast.MatMult: "@",
+        ast.Add: BinaryOperator.ADD,
+        ast.Sub: BinaryOperator.SUBTRACT,
+        ast.Mult: BinaryOperator.MULTIPLY,
+        ast.Div: BinaryOperator.TRUE_DIVIDE,
+        ast.FloorDiv: BinaryOperator.FLOOR_DIVIDE,
+        ast.Mod: BinaryOperator.MODULO,
+        ast.Pow: BinaryOperator.POWER,
+        ast.LShift: BinaryOperator.LEFT_SHIFT,
+        ast.RShift: BinaryOperator.RIGHT_SHIFT,
+        ast.BitAnd: BinaryOperator.BITWISE_AND,
+        ast.BitOr: BinaryOperator.BITWISE_OR,
+        ast.BitXor: BinaryOperator.BITWISE_XOR,
+        ast.MatMult: BinaryOperator.MATRIX_MULTIPLY,
     }
     for cls, name in mapping.items():
         if isinstance(op, cls):
@@ -3592,8 +4063,13 @@ def binary_op(state: CompilerState, op: ast.AST) -> str:
     )
 
 
-def unary_op(state: CompilerState, op: ast.AST) -> str:
-    mapping = {ast.UAdd: "+", ast.USub: "-", ast.Not: "not", ast.Invert: "~"}
+def unary_op(state: CompilerState, op: ast.AST) -> UnaryOperator:
+    mapping = {
+        ast.UAdd: UnaryOperator.POSITIVE,
+        ast.USub: UnaryOperator.NEGATIVE,
+        ast.Not: UnaryOperator.NOT,
+        ast.Invert: UnaryOperator.INVERT,
+    }
     for cls, name in mapping.items():
         if isinstance(op, cls):
             return name
@@ -3602,18 +4078,18 @@ def unary_op(state: CompilerState, op: ast.AST) -> str:
     )
 
 
-def compare_op(state: CompilerState, op: ast.AST) -> str:
+def compare_op(state: CompilerState, op: ast.AST) -> ComparisonOperator:
     mapping = {
-        ast.Lt: "<",
-        ast.LtE: "<=",
-        ast.Eq: "==",
-        ast.NotEq: "!=",
-        ast.Gt: ">",
-        ast.GtE: ">=",
-        ast.Is: "is",
-        ast.IsNot: "is not",
-        ast.In: "in",
-        ast.NotIn: "not in",
+        ast.Lt: ComparisonOperator.LESS_THAN,
+        ast.LtE: ComparisonOperator.LESS_THAN_OR_EQUAL,
+        ast.Eq: ComparisonOperator.EQUAL,
+        ast.NotEq: ComparisonOperator.NOT_EQUAL,
+        ast.Gt: ComparisonOperator.GREATER_THAN,
+        ast.GtE: ComparisonOperator.GREATER_THAN_OR_EQUAL,
+        ast.Is: ComparisonOperator.IS,
+        ast.IsNot: ComparisonOperator.IS_NOT,
+        ast.In: ComparisonOperator.IN,
+        ast.NotIn: ComparisonOperator.NOT_IN,
     }
     for cls, name in mapping.items():
         if isinstance(op, cls):

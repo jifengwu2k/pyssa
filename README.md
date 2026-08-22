@@ -14,11 +14,13 @@ It lowers Python AST into an explicit control-flow IR with nested regions, basic
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install pyssa-ir
 ```
 
+The distribution is named `pyssa-ir`; the import package remains `pyssa`.
+
 Dependencies:
-- Python 3.6+
+- Python 3.6+ (newer syntax can be lowered when it is supported by the running Python parser)
 - `attrs`
 - `cowlist`
 - `typing_extensions`
@@ -39,7 +41,7 @@ Unhandled instructions will raise `NotImplementedError`.
 
 ```python
 from pyssa.compiler import compile_source, new_compiler_state
-from pyssa.ir import print_region_ir
+from pyssa.ir import BinaryOperator, print_region_ir
 from pyssa.interpreter import BaseFrame, make_frame, NextInstructionEvent, ReturnEvent
 
 
@@ -54,7 +56,7 @@ print_region_ir(module_ir)
 #     block L0:
 #       t0 = LoadName(scope=<Scope.NAME: 'name'>, name='x')
 #       t1 = LoadName(scope=<Scope.NAME: 'name'>, name='y')
-#       t2 = BinaryOp(op='+', lhs=t0, rhs=t1)
+#       t2 = BinaryOp(op=<BinaryOperator.ADD: '+'>, lhs=t0, rhs=t1)
 #       StoreName(src=t2, scope=<Scope.NAME: 'name'>, name='result')
 #       t3 = Const(value=None)
 #       Return(value=t3)
@@ -85,7 +87,7 @@ class TinyAddOnlyFrame(BaseFrame):
         return NextInstructionEvent()
 
     def dispatch_binary_op(self, instr):
-        if instr.op != "+":
+        if instr.op != BinaryOperator.ADD:
             raise NotImplementedError(
                 "TinyAddOnlyFrame only supports addition"
             )
@@ -124,6 +126,7 @@ The IR is defined in terms of a small set of core classes:
 - **`BasicBlock`** — a straight-line sequence of `Instruction`s with a `BasicBlockLabel`.
 - **`Instruction`** — two families: `ValueInstruction` (produces a result in `dst: TemporaryValue`) and `EffectInstruction` (side effects only).
 - **Operands** — `TemporaryValue` (SSA-style temporaries), `BasicBlockLabel`, `RegionLabel`, `SyntheticLocal` (compiler-generated locals), and `UnpackedTemporaryValue` (splat markers).
+- **Structured kinds** — scopes, operators, comparisons, formatting conversions, synthetic-local purposes, type-parameter kinds, and code flags use enums rather than string or integer tags.
 
 ## Case study: cyclomatic complexity three ways
 
@@ -155,9 +158,9 @@ All three emit the same recursive JSON shape:
 
 | Tool | Basis | LOC | Sum | Min | Max | Avg | Stddev |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `cyclomatic_complexity.py` | pyssa `Region` CFG | 94 | 19 | 1 | 13 | 3.80 | 4.67 |
-| `cyclomatic_complexity_ast.py` | Python AST | 238 | 71 | 1 | 10 | 1.97 | 1.72 |
-| `cyclomatic_complexity_bytecode.py` | CPython bytecode | 202 | 59 | 1 | 32 | 5.36 | 8.51 |
+| `cyclomatic_complexity.py` | pyssa `Region` CFG | 95 | 123 | 1 | 23 | 2.93 | 4.40 |
+| `cyclomatic_complexity_ast.py` | Python AST | 238 | 120 | 1 | 6 | 2.11 | 1.22 |
+| `cyclomatic_complexity_bytecode.py` | CPython bytecode | 202 | 837 | 1 | 259 | 19.93 | 45.04 |
 
 The pyssa-based implementation is the smallest by LOC. With pyssa, the hard parts are already explicit in the IR:
 
@@ -195,9 +198,9 @@ The pyssa-based implementation is the smallest by LOC. With pyssa, the hard part
 | `Return` | Supported | |
 | `Delete` | Supported | names, attributes, subscripts, tuple/list targets |
 | `Assign` | Supported | includes tuple/list unpacking |
-| `TypeAlias` | Not yet | |
+| `TypeAlias` | Supported | PEP 695 `type X = ...` with lazy value region |
 | `AugAssign` | Supported | names, attributes, subscripts |
-| `AnnAssign` | Partial | value-bearing forms supported; annotations mostly ignored |
+| `AnnAssign` | Supported | value-bearing forms plus lazy annotation/target regions |
 | `For` | Supported | includes `else` |
 | `AsyncFor` | Supported | includes `else` |
 | `While` | Supported | includes `else` |
@@ -271,5 +274,5 @@ The pyssa-based implementation is the smallest by LOC. With pyssa, the hard part
 | `match_case` | Partial | supported for currently lowered `match` subset |
 | `pattern` variants | Partial | value/singleton/or/as, sequence, mapping, class patterns |
 | `type_ignore` | Ignored | |
-| `type_param` variants | Not yet | |
+| `type_param` variants | Supported | PEP 695 bounds/defaults lowered as lazy regions |
 

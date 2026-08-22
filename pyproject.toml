@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyssa-ir"
+version = "0.1.0a0"
+description = "A Python IR with pluggable execution semantics"
+readme = "README.md"
+requires-python = ">=3.6"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Jifeng Wu", email = "jifengwu2k@gmail.com" },
+]
+keywords = [
+    "compiler",
+    "control-flow-graph",
+    "intermediate-representation",
+    "python",
+    "static-analysis",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "attrs",
+    "cowlist",
+    "typing-extensions",
+]
+
+[project.urls]
+Homepage = "https://github.com/jifengwu2k/pyssa"
+Repository = "https://github.com/jifengwu2k/pyssa.git"
+Issues = "https://github.com/jifengwu2k/pyssa/issues"
+
+[tool.setuptools.packages.find]
+include = ["pyssa*"]
+exclude = ["tests*"]

@@ -16,6 +16,12 @@ import json
 import sys
 from typing import Dict, List, Optional, Sequence
 
+# ``ast.MatchAs`` only exists on Python 3.10+; guard it for older interpreters.
+if sys.version_info >= (3, 10):
+    MatchAsNode = ast.MatchAs
+else:
+    MatchAsNode = None
+
 
 class ScopeNode:
     def __init__(self, name: str) -> None:
@@ -181,7 +187,7 @@ class ComplexityBuilder:
     def visit_Try(self, node: ast.Try, scope: ScopeNode) -> None:
         self.visit_try_like(node, scope)
 
-    def visit_TryStar(self, node: ast.TryStar, scope: ScopeNode) -> None:
+    def visit_TryStar(self, node: "ast.TryStar", scope: ScopeNode) -> None:
         self.visit_try_like(node, scope)
 
     def visit_try_like(self, node: ast.AST, scope: ScopeNode) -> None:
@@ -199,14 +205,18 @@ class ComplexityBuilder:
         for value in node.values:
             self.visit_expr(value, scope)
 
-    def visit_Match(self, node: ast.Match, scope: ScopeNode) -> None:
+    def visit_Match(self, node: "ast.Match", scope: ScopeNode) -> None:
         self.visit_expr(node.subject, scope)
         for case in node.cases:
-            if not (isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.pattern.name is None):
+            if not (
+                isinstance(case.pattern, MatchAsNode)
+                and case.pattern.pattern is None
+                and case.pattern.name is None
+            ):
                 self.add(scope)
             self.visit_match_case(case, scope)
 
-    def visit_match_case(self, node: ast.match_case, scope: ScopeNode) -> None:
+    def visit_match_case(self, node: "ast.match_case", scope: ScopeNode) -> None:
         self.visit_pattern(node.pattern, scope)
         if node.guard is not None:
             self.add(scope)
